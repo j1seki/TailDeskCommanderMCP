@@ -1,4 +1,50 @@
-# Desktop Commander MCP
+# TailDeskCommanderMCP
+
+TailDeskCommanderMCP is a fork of [Desktop Commander MCP](https://github.com/wonderwhy-er/DesktopCommanderMCP). It lets ChatGPT use the file, search, and terminal tools on a computer you control through a self-hosted MCP connection.
+
+## What this fork adds
+
+- A Streamable HTTP gateway for the upstream MCP server, with public HTTPS through Tailscale Funnel and a built-in single-user OAuth server using authorization code with S256 PKCE.
+- **Desktop Commander Connect**, a portable Tauri app with a Rust backend and a React, TypeScript, and Radix UI frontend. It bundles Node.js, the MCP server, and ripgrep.
+- Start, stop, and tray controls, a guided ChatGPT setup with copy buttons, searchable session logs, and saved settings for the Funnel port, OAuth callback, and window behavior.
+- A [shell launcher](#self-host-for-chatgpt) for running the same gateway from a checkout on Linux or macOS.
+
+## Use the portable app
+
+1. Install [Tailscale](https://tailscale.com/download) and sign in on the computer you want to control. Enable [Funnel](https://tailscale.com/docs/features/tailscale-funnel) for that device if prompted.
+2. Download the package for your platform from the latest successful [TailDeskCommanderMCP packages run](https://github.com/j1seki/TailDeskCommanderMCP/actions/workflows/desktop-connect.yml?query=branch%3Amain+is%3Asuccess) and extract the artifact. Open **Desktop Commander Connect**, then click **Start connection**.
+3. In the app's **ChatGPT setup** tab, copy the server URL. In ChatGPT, go to **Plugins → Add custom MCP server**, paste the `/mcp` URL, and select **OAuth**. Enter the client ID and client secret from the app.
+4. When the Desktop Commander sign-in page opens, paste the separate **Login password** and click **Authorize**. The desktop app can stay in the tray while you use ChatGPT on another device.
+
+The portable app supplies its own Node runtime. The **Settings** tab controls the connection and tray behavior. Use the MCP tools `get_config` and `set_config_value` for Desktop Commander settings such as allowed directories. Authorized clients can run file and terminal operations with the permissions of the account running the app.
+
+## Build outputs
+
+| Platform | GitHub Actions artifact |
+| --- | --- |
+| Windows x64 | `desktop-commander-connect-windows-x64` containing the portable `.exe` |
+| macOS Apple Silicon or Intel | `desktop-commander-connect-macos-arm64` or `desktop-commander-connect-macos-x64` containing a zipped `.app` |
+| Linux x64 or ARM64 | `desktop-commander-connect-linux-x64` or `desktop-commander-connect-linux-arm64` containing an AppImage |
+
+AppImages may need executable permission after download. The macOS builds are ad hoc signed and require macOS 13.5 or newer. See the [desktop setup and local build guide](desktop/README.md) for development prerequisites and commands.
+
+## Bring in upstream changes safely
+
+Keep your fork as `origin` and add the original repository as `upstream` once. For each update, start a branch from your fork's current `main` and merge upstream into that branch:
+
+```bash
+git remote add upstream https://github.com/wonderwhy-er/DesktopCommanderMCP.git
+git fetch origin main
+git fetch upstream main
+git switch -c sync/upstream-update origin/main
+git merge --no-ff upstream/main
+git push -u origin HEAD
+```
+
+Use a fresh branch name for each update. Resolve conflicts on the update branch, then open a pull request **into `j1seki/TailDeskCommanderMCP:main`**. The **Desktop packages verified** check waits for OAuth/MCP integration tests and builds across the supported platforms. Review the changes and smoke-test a package before merging. Use a merge commit to preserve the upstream history for future updates. To enforce the CI gate on GitHub, set **Desktop packages verified** as a required check for `main` in branch protection.
+
+## Upstream Desktop Commander documentation
+
 ### Search, update, manage files and run terminal commands with AI
 
 [![npm downloads](https://img.shields.io/npm/dw/@wonderwhy-er/desktop-commander)](https://www.npmjs.com/package/@wonderwhy-er/desktop-commander)
@@ -83,6 +129,8 @@ Execute long-running terminal commands on your computer and manage processes thr
 ## How to install
 
 For ChatGPT, Claude web, and other remote clients, see the [Remote device launchers](scripts/remote/README.md). They install Node.js when missing and run Desktop Commander Remote on macOS, Linux, or Windows.
+
+For a self-hosted ChatGPT connection, use the [portable desktop app](desktop/README.md) or the [Tailscale Funnel launcher](#self-host-for-chatgpt).
 
 ### Install in Claude Desktop
 
@@ -302,6 +350,24 @@ bash <(curl -fsSL https://raw.githubusercontent.com/wonderwhy-er/DesktopCommande
 **🔄 Manual Update:** `docker pull mcp/desktop-commander:latest` then restart Claude  
 
 </details>
+
+### Self-host for ChatGPT
+
+On Linux or macOS, run this from the repository with Node.js 22.12+ and Tailscale signed in to a tailnet with Funnel enabled.
+
+```bash
+./start-chatgpt-mcp.sh
+```
+
+The launcher installs the project dependencies as needed, builds Desktop Commander, and starts an OAuth-protected Streamable HTTP endpoint. Tailscale Funnel provides the public HTTPS URL. The launcher takes the first available Funnel port among `443`, `8443`, and `10000`. Set `DC_CHATGPT_FUNNEL_PORT` to a free port to keep the URL stable across launches. Tailscale may ask for `sudo` permission to open the route.
+
+In ChatGPT, go to **Plugins → Add custom MCP server**. Use the printed `/mcp` URL and select **OAuth**. Use the `clientId` and `clientSecret` from the private credentials file whose path the launcher prints. When the Desktop Commander login page opens, enter the `loginPassword` from that file and select **Authorize**. See [ChatGPT's custom MCP server setup](https://developers.openai.com/api/docs/guides/custom-mcp-server).
+
+The launcher accepts ChatGPT's stable callback `https://chatgpt.com/connector_platform_oauth_redirect`. If ChatGPT displays a callback of the form `https://chatgpt.com/connector/oauth/<callback_id>`, set `DC_CHATGPT_REDIRECT_URI` to that exact URL and restart the launcher.
+
+Anyone you authorize can use the file and terminal tools with the permissions of the operating-system account running Desktop Commander. Keep the credential file private. Press **Ctrl+C** to shut down the gateway and remove its Funnel route. The local credentials are reused on restart.
+
+To run the OAuth and MCP integration test on loopback, run `npm run build` followed by `node --test test/integration/chatgpt-mcp.js`.
 
 ### Install in Other Clients
 

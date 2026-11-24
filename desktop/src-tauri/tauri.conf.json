@@ -1,0 +1,29 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Desktop Commander Connect",
+  "version": "0.3.5",
+  "identifier": "io.desktopcommander.connect",
+  "build": {
+    "beforeBuildCommand": "npm run build",
+    "frontendDist": "../ui"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "Desktop Commander Connect",
+        "width": 1110,
+        "height": 820,
+        "minWidth": 615,
+        "minHeight": 585,
+        "center": true
+      }
+    ],
+    "security": { "csp": "default-src 'self'; style-src 'self'; img-src 'self' data:; connect-src ipc: http://ipc.localhost" }
+  },
+  "bundle": {
+    "active": true,
+    "icon": ["icons/32x32.png", "icons/128x128.png", "icons/icon.icns", "icons/icon.ico"],
+    "linux": { "appimage": { "bundleMediaFramework": false } },
+    "macOS": { "minimumSystemVersion": "13.5" }
+  }
+}
