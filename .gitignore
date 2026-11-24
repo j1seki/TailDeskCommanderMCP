@@ -61,3 +61,4 @@ test_search.js
 
 # Test reports: junit.xml, results.json, results.tap per runner (test/README.md)
 test-results/
+desktop-release/

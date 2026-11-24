@@ -6,6 +6,7 @@ case "${1:-}" in
   --help|-h)
     printf '%s\n' 'Usage: ./start-chatgpt-mcp.sh [--local]' \
       'Starts Desktop Commander over HTTPS with OAuth and Tailscale Funnel.' \
+      'Set DC_MCP_TUNNEL=cloudflare to use an installed cloudflared Quick Tunnel.' \
       '--local serves OAuth and MCP on loopback HTTP for development.'
     exit 0 ;;
   --local|'') ;;
@@ -28,9 +29,16 @@ if ! command -v npm >/dev/null || ! node -e 'const [major, minor] = process.vers
   exit 1
 fi
 
-if [[ "${1:-}" != --local ]] && ! command -v tailscale >/dev/null; then
-  printf '%s\n' 'Install Tailscale and connect it to your tailnet before starting Funnel.' >&2
-  exit 1
+if [[ "${1:-}" != --local ]]; then
+  case "${DC_MCP_TUNNEL:-tailscale}" in
+    tailscale) tunnel_cli=${DC_CHATGPT_TAILSCALE:-tailscale} ;;
+    cloudflare) tunnel_cli=${DC_MCP_CLOUDFLARED:-cloudflared} ;;
+    *) printf '%s\n' 'DC_MCP_TUNNEL must be tailscale or cloudflare.' >&2; exit 2 ;;
+  esac
+  if ! command -v "$tunnel_cli" >/dev/null; then
+    printf 'Install %s before starting the public MCP tunnel.\n' "$tunnel_cli" >&2
+    exit 1
+  fi
 fi
 
 if [[ ! -f node_modules/.package-lock.json || package-lock.json -nt node_modules/.package-lock.json || ! -x node_modules/.bin/tsc ]]; then

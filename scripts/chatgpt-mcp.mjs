@@ -1,13 +1,19 @@
 import { execFile, spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { once } from 'node:events';
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:http';
+import { get } from 'node:https';
+import { isIPv4 } from 'node:net';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { createInterface } from 'node:readline';
+import { setTimeout as delay } from 'node:timers/promises';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
-import { InitializeRequestSchema, isJSONRPCRequest, isJSONRPCResultResponse } from '@modelcontextprotocol/sdk/types.js';
+import { InitializeRequestSchema, isJSONRPCErrorResponse, isJSONRPCRequest, isJSONRPCResultResponse } from '@modelcontextprotocol/sdk/types.js';
 import { createOAuth, HttpError, loadCredentials, readBody, sendJson, SCOPE } from './chatgpt-oauth.mjs';
 
 const run = promisify(execFile);
@@ -19,6 +25,8 @@ const MAX_MCP_BODY = 8 * 1024 * 1024;
 const FUNNEL_PORTS = [443, 8443, 10000];
 const desktop = process.argv.includes('--desktop');
 const tailscale = process.env.DC_CHATGPT_TAILSCALE || 'tailscale';
+const cloudflared = process.env.DC_MCP_CLOUDFLARED || 'cloudflared';
+const providerNames = { chatgpt: 'ChatGPT', gemini: 'Gemini' };
 
 function emit(type, fields = {}) {
   if (desktop) console.log(JSON.stringify({ type, ...fields }));
@@ -26,6 +34,14 @@ function emit(type, fields = {}) {
 
 function log(source, message, level = 'info') {
   emit('log', { source, message, level });
+}
+
+function report(component, status, message, provider) {
+  emit('diagnostic', { component, status, provider });
+  const source = component === 'oauth' ? 'OAuth' : component === 'mcp' ? 'MCP' : 'Tunnel';
+  const detail = provider ? `${providerNames[provider]}: ${message}` : message;
+  if (desktop) log(source, detail, status === 'failed' ? 'warning' : 'info');
+  else if (component === 'oauth' || component === 'https') console.log(detail);
 }
 
 function redactSetupLinks(message) {
@@ -58,12 +74,12 @@ async function getFunnelAddress() {
   return { port, issuer: new URL(`https://${hostname}:${port}`).origin };
 }
 
-function createMcpBridge(oauth) {
+function createMcpBridge(oauth, jsonResponses) {
   const sessions = new Map();
   const connections = new Set();
   let closing = false;
 
-  async function createSession() {
+  async function createSession(provider) {
     if (closing) throw new HttpError(503, 'MCP server is shutting down');
     if (connections.size >= MAX_SESSIONS) throw new HttpError(503, 'Too many active MCP sessions');
     const stdio = new StdioClientTransport({
@@ -75,9 +91,9 @@ function createMcpBridge(oauth) {
     const transport = new StreamableHTTPServerTransport({
       sessionIdGenerator: randomUUID,
       onsessioninitialized: id => { sessions.set(id, connection); },
-      enableJsonResponse: false,
+      enableJsonResponse: jsonResponses,
     });
-    const connection = { transport, lastActive: Date.now(), close };
+    const connection = { transport, provider, lastActive: Date.now(), close };
     connections.add(connection);
 
     async function close() {
@@ -97,7 +113,9 @@ function createMcpBridge(oauth) {
       const request = pending.get(message.id);
       if (message.id !== undefined && !isJSONRPCRequest(message)) pending.delete(message.id);
       if (request?.method === 'initialize' && isJSONRPCResultResponse(message)) {
-        log('MCP', 'A client opened an authenticated session.');
+        report('mcp', 'passed', 'Opened an authenticated MCP session.', provider);
+      } else if (request?.method === 'initialize' && isJSONRPCErrorResponse(message)) {
+        report('mcp', 'failed', 'The MCP runtime rejected session initialization.', provider);
       }
       if (request?.method === 'tools/list' && isJSONRPCResultResponse(message) && Array.isArray(message.result.tools)) {
         const securitySchemes = [{ type: 'oauth2', scopes: [SCOPE] }];
@@ -131,10 +149,15 @@ function createMcpBridge(oauth) {
 
   return {
     async handle(request, response) {
-      if (!oauth.authorizeMcp(request, response)) return;
+      const provider = oauth.authorizeMcp(request, response);
+      if (!provider) return;
+      if (jsonResponses && request.method === 'GET') {
+        response.setHeader('Allow', 'POST, DELETE');
+        return sendJson(response, 405, { error: 'SSE is unavailable on this tunnel' });
+      }
       const sessionId = request.headers['mcp-session-id'];
       let session = sessions.get(sessionId);
-      if (sessionId && !session) {
+      if (sessionId && session?.provider !== provider) {
         return sendJson(response, 404, {
           jsonrpc: '2.0', error: { code: -32001, message: 'Session not found' }, id: null,
         });
@@ -156,13 +179,16 @@ function createMcpBridge(oauth) {
         });
       }
       const newSession = !session;
-      session ??= await createSession();
+      session ??= await createSession(provider);
       session.lastActive = Date.now();
       try {
         await session.transport.handleRequest(request, response, body);
       } finally {
         if (newSession && !session.transport.sessionId) await session.close();
       }
+    },
+    async revoke(provider) {
+      await Promise.all([...connections].filter(connection => connection.provider === provider).map(connection => connection.close()));
     },
     async close() {
       closing = true;
@@ -172,7 +198,7 @@ function createMcpBridge(oauth) {
   };
 }
 
-function startFunnel(args, useSudo = false) {
+function startFunnel(args, ready, useSudo = false) {
   const interactive = useSudo && process.stdin.isTTY;
   const stdio = [interactive ? 'inherit' : 'ignore', 'pipe', 'pipe'];
   const options = { stdio, windowsHide: true };
@@ -187,7 +213,7 @@ function startFunnel(args, useSudo = false) {
   if (desktop) {
     let setupUrl;
     function handleLine(line) {
-      if (line.includes('Available on the internet:')) emit('ready');
+      if (line.includes('Available on the internet:')) ready();
       const url = line.match(/https:\/\/login\.tailscale\.com\/[a-zA-Z0-9_/?=&%.-]+/)?.[0];
       if (url && url !== setupUrl) {
         setupUrl = url;
@@ -203,19 +229,108 @@ function startFunnel(args, useSudo = false) {
   return { child, closed };
 }
 
+function startQuickTunnel(localPort, config) {
+  const child = spawn(cloudflared, [
+    'tunnel', '--config', config, '--no-autoupdate', '--protocol', 'http2', '--url', `http://127.0.0.1:${localPort}`,
+  ], { stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true });
+  const closed = new Promise(resolve => child.once('close', resolve));
+  const address = new Promise((resolve, reject) => {
+    let lastError;
+    const timeout = setTimeout(() => reject(new Error('Cloudflare did not assign a Quick Tunnel URL in time.')), 35_000);
+    for (const stream of [child.stdout, child.stderr]) {
+      createInterface({ input: stream }).on('line', line => {
+        if (/\bERR\b|\bfailed\b/i.test(line)) lastError = line.slice(0, 500);
+        const url = line.match(/https:\/\/[a-z0-9-]+\.trycloudflare\.com\b/i)?.[0];
+        if (url) {
+          clearTimeout(timeout);
+          resolve(new URL(url).origin);
+        }
+      });
+    }
+    child.once('error', error => {
+      clearTimeout(timeout);
+      reject(new Error(error.code === 'ENOENT' ? 'Install cloudflared to start a Quick Tunnel.' : 'Could not start cloudflared.'));
+    });
+    void closed.then(() => {
+      clearTimeout(timeout);
+      reject(new Error(lastError || 'cloudflared exited before providing a Quick Tunnel URL.'));
+    });
+  });
+  return { child, closed, address };
+}
+
+async function probeQuickTunnel(endpoint, signal) {
+  const url = new URL(endpoint);
+  const dns = new URL('https://cloudflare-dns.com/dns-query');
+  dns.search = new URLSearchParams({ name: url.hostname, type: 'A' });
+  const answer = await fetch(dns, { signal, headers: { Accept: 'application/dns-json' } });
+  const { Answer = [] } = await answer.json();
+  const addresses = Answer.filter(record => record.type === 1 && isIPv4(record.data));
+  if (!addresses.length) return false;
+  return new Promise((resolve, reject) => {
+    const request = get(url, {
+      signal,
+      lookup: (_name, options, done) => {
+        if (options.all) done(null, addresses.map(({ data }) => ({ address: data, family: 4 })));
+        else done(null, addresses[0].data, 4);
+      },
+    }, async response => {
+      try {
+        if (response.statusCode !== 200) {
+          response.resume();
+          resolve(false);
+        } else {
+          const metadata = JSON.parse(await readBody(response, 8192));
+          resolve(metadata.resource === `${url.origin}/mcp`);
+        }
+      } catch (error) {
+        reject(error);
+      }
+    });
+    request.once('error', reject);
+  });
+}
+
+async function checkHttps(issuer, signal, quick = false) {
+  const endpoint = `${issuer}/.well-known/oauth-protected-resource/mcp`;
+  for (let attempt = 0; attempt < 8 && !signal.aborted; attempt++) {
+    try {
+      const response = await fetch(endpoint, {
+        redirect: 'error', signal: AbortSignal.any([signal, AbortSignal.timeout(3_000)]),
+      });
+      if (response.ok && (await response.json()).resource === `${issuer}/mcp`) return true;
+    } catch {
+      // Some local resolvers cache negative answers for newly issued Quick Tunnel hostnames.
+      if (quick && !signal.aborted) {
+        const reachable = await probeQuickTunnel(endpoint, AbortSignal.any([signal, AbortSignal.timeout(3_000)]))
+          .catch(() => false);
+        if (reachable) return true;
+      }
+    }
+    await delay(1_000, undefined, { signal }).catch(() => {});
+  }
+  return false;
+}
+
 async function main() {
   const local = process.argv.includes('--local');
+  const tunnelMode = process.env.DC_MCP_TUNNEL || 'tailscale';
+  if (!['tailscale', 'cloudflare'].includes(tunnelMode)) throw new Error('DC_MCP_TUNNEL must be tailscale or cloudflare.');
+  const quick = !local && tunnelMode === 'cloudflare';
   const requestedPort = Number(process.env.DC_CHATGPT_LOCAL_PORT || 0);
   if (!Number.isInteger(requestedPort) || requestedPort < 0 || requestedPort > 65535) {
     throw new Error('DC_CHATGPT_LOCAL_PORT must be a TCP port number or 0 for automatic assignment.');
   }
-  const funnel = local ? undefined : await getFunnelAddress();
+  const funnel = local || quick ? undefined : await getFunnelAddress();
   const [chatgpt, gemini] = await Promise.all([loadCredentials(), loadCredentials('gemini')]);
-  let issuer, oauth, bridge, tunnel;
+  let issuer, oauth, bridge, tunnel, quickConfig, input;
   let stopping = false;
+  let controls = Promise.resolve();
+  const shutdownSignal = new AbortController();
 
   const server = createServer({ requestTimeout: 30_000, headersTimeout: 15_000 }, async (request, response) => {
     try {
+      if (!oauth) return sendJson(response, 503, { error: 'gateway_starting' });
       const url = new URL(request.url, issuer);
       if (request.headers.host !== new URL(issuer).host || url.origin !== issuer) {
         throw new HttpError(403, 'Invalid host');
@@ -249,16 +364,35 @@ async function main() {
   async function shutdown() {
     if (stopping) return;
     stopping = true;
+    shutdownSignal.abort();
+    input?.close();
     if (desktop) process.stdin.pause();
     tunnel?.child.kill('SIGTERM');
     server.close();
     server.closeAllConnections();
-    await Promise.allSettled([bridge?.close(), tunnel?.closed]);
+    await Promise.allSettled([bridge?.close(), tunnel?.closed, controls]);
   }
   process.once('SIGINT', () => { void shutdown(); });
   process.once('SIGTERM', () => { void shutdown(); });
   if (desktop) {
-    process.stdin.resume();
+    input = createInterface({ input: process.stdin });
+    input.on('line', line => {
+      if (stopping || !oauth) return;
+      try {
+        const { action, provider } = JSON.parse(line);
+        if (action !== 'revoke' || typeof provider !== 'string' || !Object.hasOwn(providerNames, provider)) return;
+        controls = controls.then(async () => {
+          await oauth.revoke(provider);
+          await bridge.revoke(provider);
+          emit('diagnostic', { component: 'mcp', provider, status: 'waiting' });
+          report('oauth', 'waiting', 'Access revoked. Link again to reconnect.', provider);
+        }).catch(() => {
+          report('oauth', 'failed', 'Could not revoke access. Check local credentials permissions.', provider);
+        });
+      } catch {
+        // Ignore malformed desktop commands.
+      }
+    });
     process.stdin.once('end', () => { void shutdown(); });
   }
 
@@ -266,9 +400,19 @@ async function main() {
     server.listen(requestedPort, '127.0.0.1');
     await once(server, 'listening');
     const localPort = server.address().port;
-    issuer = funnel?.issuer ?? `http://127.0.0.1:${localPort}`;
-    oauth = createOAuth(issuer, chatgpt, gemini);
-    bridge = createMcpBridge(oauth);
+    if (quick) {
+      log('Tunnel', 'Requesting a temporary Cloudflare URL.');
+      quickConfig = await mkdtemp(join(tmpdir(), 'taildesk-quick-'));
+      const config = join(quickConfig, 'config.yml');
+      await writeFile(config, '{}\n');
+      if (stopping) return;
+      tunnel = startQuickTunnel(localPort, config);
+      issuer = await tunnel.address;
+    } else {
+      issuer = funnel?.issuer ?? `http://127.0.0.1:${localPort}`;
+    }
+    oauth = createOAuth(issuer, chatgpt, gemini, (provider, status, message) => report('oauth', status, message, provider));
+    bridge = createMcpBridge(oauth, tunnelMode === 'cloudflare');
 
     if (desktop) {
       emit('gateway', {
@@ -285,16 +429,34 @@ async function main() {
       console.log(`Gemini OAuth client secret and login password: ${gemini.path}`);
     }
 
-    if (funnel) {
+    function reportHttps(passed) {
+      if (stopping) return;
+      report('https', passed ? 'passed' : 'failed', passed
+        ? 'HTTPS endpoint and OAuth discovery responded.'
+        : 'Could not verify the HTTPS endpoint. Check the tunnel connection.');
+    }
+    if (quick) {
+      const passed = await checkHttps(issuer, shutdownSignal.signal, true);
+      reportHttps(passed);
+      if (stopping) return;
+      if (!passed) throw new Error('The Cloudflare Quick Tunnel did not reach this MCP server.');
+      emit('ready');
+      await tunnel.closed;
+      if (!stopping) throw new Error('The Cloudflare Quick Tunnel closed. Start a new connection to get a new URL.');
+    } else if (funnel) {
       log('Funnel', `Opening the public HTTPS route on port ${funnel.port}.`);
       const args = ['funnel', `--https=${funnel.port}`, `http://127.0.0.1:${localPort}`];
-      tunnel = startFunnel(args);
+      const ready = () => {
+        emit('ready');
+        void checkHttps(issuer, shutdownSignal.signal).then(reportHttps);
+      };
+      tunnel = startFunnel(args, ready);
       let errors = await tunnel.closed;
       const denied = /access denied|permission denied|not an operator/i;
       if (!stopping && process.platform !== 'win32' && denied.test(errors)) {
         // Elevate only the Tailscale CLI. Desktop Commander runs as the invoking user.
         log('Funnel', 'Retrying Tailscale with administrator permissions.');
-        tunnel = startFunnel(args, true);
+        tunnel = startFunnel(args, ready, true);
         errors = await tunnel.closed;
       }
       if (!stopping) {
@@ -311,6 +473,7 @@ async function main() {
     }
   } finally {
     await shutdown();
+    if (quickConfig) await rm(quickConfig, { force: true, recursive: true });
   }
 }
 

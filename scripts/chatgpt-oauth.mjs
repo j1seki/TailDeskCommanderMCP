@@ -1,6 +1,6 @@
 import { createHash, createHmac, randomBytes, timingSafeEqual } from 'node:crypto';
 import { constants } from 'node:fs';
-import { link, lstat, mkdir, open, unlink, writeFile } from 'node:fs/promises';
+import { link, lstat, mkdir, open, rename, unlink, writeFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { join, resolve } from 'node:path';
 
@@ -167,7 +167,7 @@ function finishAuthorization(response, callback, showContinuation) {
 <p><a href="${href}">Return to Gemini</a></p></html>`);
 }
 
-export function createOAuth(issuer, chatgpt, gemini) {
+export function createOAuth(issuer, chatgpt, gemini, report) {
   const resource = `${issuer}/mcp`;
   const redirects = new Set([CHATGPT_CALLBACK]);
   const extraRedirect = process.env.DC_CHATGPT_REDIRECT_URI;
@@ -178,8 +178,8 @@ export function createOAuth(issuer, chatgpt, gemini) {
     redirects.add(extraRedirect);
   }
   const clients = new Map([
-    [chatgpt.clientId, { ...chatgpt, gemini: false }],
-    [gemini.clientId, { ...gemini, gemini: true }],
+    [chatgpt.clientId, { ...chatgpt, provider: 'chatgpt', gemini: false }],
+    [gemini.clientId, { ...gemini, provider: 'gemini', gemini: true }],
   ]);
   const codes = new Map();
   const sign = (client, value) => createHmac('sha256', Buffer.from(client.signingKey, 'base64url'))
@@ -244,6 +244,7 @@ export function createOAuth(issuer, chatgpt, gemini) {
     if (codes.size >= 128) return redirect('error', 'temporarily_unavailable');
     const code = randomSecret();
     codes.set(digest(code), { clientId: client.clientId, challenge, redirectUri, expires: now() + CODE_LIFETIME });
+    report(client.provider, 'waiting', 'Consent approved. Waiting for the token request.');
     return redirect('code', code);
   }
 
@@ -263,17 +264,22 @@ export function createOAuth(issuer, chatgpt, gemini) {
       secret = basicSecret;
     }
     const client = clients.get(clientId);
+    function tokenError(status, error) {
+      if (client) report(client.provider, 'failed', `Token request rejected (${error}).`);
+      return sendJson(response, status, { error });
+    }
     if (!client || !secretMatches(secret, client.clientSecret)) {
       if (auth) response.setHeader('WWW-Authenticate', 'Basic realm="Desktop Commander"');
-      return sendJson(response, 401, { error: 'invalid_client' });
+      return tokenError(401, 'invalid_client');
     }
     const grantType = form.get('grant_type');
     const requestedResource = form.get('resource');
     if (requestedResource !== resource && !(requestedResource === null && (client.gemini || grantType === 'refresh_token'))) {
-      return sendJson(response, 400, { error: 'invalid_target' });
+      return tokenError(400, 'invalid_target');
     }
 
-    const tokens = { token_type: 'Bearer', expires_in: ACCESS_LIFETIME, scope: SCOPE };
+    // Google's Account Linking response schema uses the literal lowercase value.
+    const tokens = { token_type: client.gemini ? 'bearer' : 'Bearer', expires_in: ACCESS_LIFETIME, scope: SCOPE };
     switch (grantType) {
       case 'authorization_code': {
         const key = digest(form.get('code') ?? '');
@@ -281,28 +287,50 @@ export function createOAuth(issuer, chatgpt, gemini) {
         const verifier = form.get('code_verifier') ?? '';
         if (!grant || grant.clientId !== client.clientId || grant.expires <= now() || grant.redirectUri !== form.get('redirect_uri') ||
           !PKCE_VERIFIER.test(verifier) || !secretMatches(digest(verifier), grant.challenge)) {
-          return sendJson(response, 400, { error: 'invalid_grant' });
+          return tokenError(400, 'invalid_grant');
         }
         codes.delete(key);
         tokens.refresh_token = mintToken(client, 'refresh', REFRESH_LIFETIME);
         break;
       }
       case 'refresh_token':
-        if (!verifyToken(client, form.get('refresh_token'), 'refresh')) return sendJson(response, 400, { error: 'invalid_grant' });
-        if (!acceptsScope(form.get('scope'))) return sendJson(response, 400, { error: 'invalid_scope' });
+        if (!verifyToken(client, form.get('refresh_token'), 'refresh')) return tokenError(400, 'invalid_grant');
+        if (!acceptsScope(form.get('scope'))) return tokenError(400, 'invalid_scope');
         break;
       default:
-        return sendJson(response, 400, { error: 'unsupported_grant_type' });
+        return tokenError(400, 'unsupported_grant_type');
     }
+    report(client.provider, 'passed', grantType === 'authorization_code'
+      ? 'Authorization code exchanged for tokens.'
+      : 'Access token refreshed.');
     return sendJson(response, 200, { ...tokens, access_token: mintToken(client, 'access', ACCESS_LIFETIME) });
   }
 
   return {
+    async revoke(provider) {
+      const client = clients.get(`desktop-commander-${provider}`);
+      if (!client) throw new Error('Unknown OAuth client');
+      const { clientId, clientSecret, loginPassword, path } = client;
+      const signingKey = randomSecret();
+      const temporary = `${path}.${randomSecret()}.tmp`;
+      await writeFile(temporary, `${JSON.stringify({ clientId, clientSecret, loginPassword, signingKey }, null, 2)}\n`,
+        { mode: 0o600, flag: 'wx' });
+      try {
+        await rename(temporary, path);
+      } catch (error) {
+        await unlink(temporary).catch(() => {});
+        throw error;
+      }
+      client.signingKey = signingKey;
+      for (const [code, grant] of codes) {
+        if (grant.clientId === clientId) codes.delete(code);
+      }
+    },
     authorizeMcp(request, response) {
       const authorization = request.headers.authorization;
       const token = /^Bearer (\S+)$/i.exec(authorization ?? '')?.[1];
       for (const client of clients.values()) {
-        if (verifyToken(client, token, 'access')) return true;
+        if (verifyToken(client, token, 'access')) return client.provider;
       }
       const error = authorization ? ', error="invalid_token"' : '';
       response.setHeader('WWW-Authenticate', `Bearer resource_metadata="${issuer}${RESOURCE_METADATA_PATH}", scope="${SCOPE}"${error}`);

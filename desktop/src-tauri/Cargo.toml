@@ -1,6 +1,6 @@
 [package]
 name = "desktop-commander-connect"
-version = "0.3.6"
+version = "0.4.0"
 edition = "2021"
 
 [build-dependencies]
@@ -8,14 +8,20 @@ tauri-build = { version = "2.7", features = [] }
 
 [dependencies]
 flate2 = "1"
+regex = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tar = "0.4"
 tauri = { version = "2.12", features = ["tray-icon", "image-png"] }
 tauri-plugin-clipboard-manager = "2.5"
+tauri-plugin-updater = "2.14.1"
 tempfile = "3"
 time = { version = "0.3", features = ["formatting"] }
 which = "8"
+
+[target.'cfg(windows)'.dependencies]
+base64 = "0.22"
+minisign-verify = "0.3"
 
 [profile.release]
 strip = true

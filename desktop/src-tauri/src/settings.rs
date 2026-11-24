@@ -1,12 +1,22 @@
 use serde::{Deserialize, Serialize};
 use std::{fs, path::Path};
 
+#[derive(Clone, Copy, Default, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Tunnel {
+    #[default]
+    Tailscale,
+    Cloudflare,
+}
+
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct Settings {
     pub funnel_port: Option<u16>,
     pub callback_uri: String,
     pub close_to_tray: bool,
+    pub tunnel: Tunnel,
+    pub auto_check_updates: bool,
 }
 
 impl Default for Settings {
@@ -15,6 +25,8 @@ impl Default for Settings {
             funnel_port: None,
             callback_uri: String::new(),
             close_to_tray: true,
+            tunnel: Tunnel::Tailscale,
+            auto_check_updates: true,
         }
     }
 }
@@ -82,6 +94,7 @@ mod tests {
             funnel_port: Some(8443),
             callback_uri: " https://chatgpt.com/connector/oauth/sample-id ".into(),
             close_to_tray: false,
+            ..Settings::default()
         };
         settings.save(dir.path()).unwrap();
         let saved = Settings::load(dir.path()).unwrap();

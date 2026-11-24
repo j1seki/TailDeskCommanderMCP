@@ -85,6 +85,19 @@ code { display: block; font: .72rem/1.4 var(--mono); color: #dbece7; overflow-wr
 .metric-icon svg { width: 16px; height: 16px; }
 .panel-heading { padding: 15px 16px; }
 .panel-heading > svg { color: #93aaa8; }
+.checks { padding: 0 16px 14px; }
+.checks > div { display: flex; align-items: center; justify-content: space-between; padding: 10px 0; }
+.checks table { width: 100%; text-align: left; border-collapse: collapse; font-size: .78rem; }
+.checks th, .checks td { border-top: 1px solid var(--line); padding: 8px 6px 8px 0; }
+.checks thead th { color: var(--muted); }
+.check-result { display: inline-flex; align-items: center; gap: 5px; font-size: .75rem; color: #aabfbb; }
+.check-result.passed { color: var(--green); }
+.check-result.failed { color: #f3a091; }
+.check-result .dot { width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
+.revoke-actions { display: grid; gap: 8px; }
+.update-controls { border-top: 1px solid var(--line); display: grid; gap: 10px; padding: 14px 16px; }
+.update-controls .row-actions { justify-content: flex-start; flex-wrap: wrap; }
+.update-controls progress { width: 100%; accent-color: var(--green); }
 .icon-heading { display: flex; align-items: center; gap: 9px; }
 .client-choice { display: inline-flex; justify-self: start; gap: 4px; padding: 4px; border: 1px solid var(--line); border-radius: 9px; background: var(--panel); }
 .client-choice button { min-width: 86px; padding: 7px 11px; border: 1px solid transparent; border-radius: 6px; background: transparent; color: var(--muted); font-size: .8rem; font-weight: 630; }

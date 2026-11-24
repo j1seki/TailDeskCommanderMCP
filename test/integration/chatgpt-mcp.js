@@ -19,6 +19,7 @@ const callbacks = {
 };
 const publicRelay = process.env.DC_CHATGPT_TEST_RELAY;
 const externalUrl = process.env.DC_CHATGPT_TEST_URL;
+const externalJson = process.env.DC_CHATGPT_TEST_JSON === '1';
 const windows = process.platform === 'win32';
 
 // Resolve the hostname to a public Funnel relay even when MagicDNS returns the tailnet IP.
@@ -42,7 +43,7 @@ function fetchMcp(url, options = {}) {
   });
 }
 
-async function checkConnection(t, provider) {
+async function checkConnection(t, provider, jsonResponses) {
   const gemini = provider === 'gemini';
   const callback = callbacks[provider];
   const otherProvider = gemini ? 'chatgpt' : 'gemini';
@@ -55,6 +56,7 @@ async function checkConnection(t, provider) {
   const stateDir = (externalUrl && process.env.DC_CHATGPT_TEST_STATE_DIR) || join(dir, 'oauth');
   const credentialPath = join(stateDir, `${provider}-oauth.json`);
   let existingCredentials;
+  let gateway, events;
   let base = externalUrl;
   if (!base) {
     const testHome = join(dir, 'home');
@@ -70,9 +72,10 @@ async function checkConnection(t, provider) {
       await writeFile(credentialPath, JSON.stringify(existingCredentials), { mode: 0o600 });
     }
     const entry = fileURLToPath(new URL('../../scripts/chatgpt-mcp.mjs', import.meta.url));
-    const gateway = spawn(process.execPath, [entry, '--local', '--desktop'], {
+    gateway = spawn(process.execPath, [entry, '--local', '--desktop'], {
       env: {
         ...process.env, HOME: testHome, USERPROFILE: testHome, DC_CHATGPT_STATE_DIR: stateDir,
+        DC_MCP_TUNNEL: jsonResponses ? 'cloudflare' : 'tailscale',
         DC_CHATGPT_LOCAL_PORT: '0', DESKTOP_COMMANDER_DISABLE_TELEMETRY: '1',
       },
       stdio: ['pipe', 'pipe', 'inherit'],
@@ -82,9 +85,11 @@ async function checkConnection(t, provider) {
       gateway.stdin.end();
       await closed;
     };
-    const lines = createInterface({ input: gateway.stdout });
-    for await (const line of lines) {
-      const event = JSON.parse(line);
+    events = createInterface({ input: gateway.stdout })[Symbol.asyncIterator]();
+    while (true) {
+      const line = await events.next();
+      if (line.done) break;
+      const event = JSON.parse(line.value);
       if (event.type === 'gateway') {
         base = new URL(event.url).origin;
         break;
@@ -194,7 +199,10 @@ async function checkConnection(t, provider) {
   const tokenResponse = await postForm(discovery.token_endpoint, exchange);
   assert.equal(tokenResponse.status, 200);
   const tokens = await tokenResponse.json();
+  // Google Account Linking's token response schema specifies lowercase bearer.
+  assert.equal(tokens.token_type, gemini ? 'bearer' : 'Bearer');
   assert.equal(tokens.scope, 'desktop-commander');
+  assert.ok(tokens.refresh_token);
   const replay = await postForm(discovery.token_endpoint, exchange);
   assert.equal((await replay.json()).error, 'invalid_grant');
   const wrongTokenType = await fetchMcp(resource, { headers: { Authorization: `Bearer ${tokens.refresh_token}` } });
@@ -211,10 +219,11 @@ async function checkConnection(t, provider) {
   }, { Authorization: `Basic ${Buffer.from(`${clientId}:${clientSecret}`).toString('base64')}` });
   assert.equal(refresh.status, 200);
   const refreshed = await refresh.json();
+  assert.equal(refreshed.token_type, tokens.token_type);
   assert.ok(refreshed.access_token && refreshed.access_token !== tokens.access_token);
   t.diagnostic('OAuth login, exact callback, issuer and state, S256 exchange, replay rejection, and token refresh verified');
 
-  let streamed = false;
+  let expectedResponse = false;
   let accessToken = refreshed.access_token;
   if (existingCredentials) {
     // Exercise the previous gateway's signed refresh-token format using its original signing key.
@@ -232,10 +241,11 @@ async function checkConnection(t, provider) {
     t.diagnostic('Existing ChatGPT credentials were preserved and a pre-upgrade refresh token was accepted');
   }
   const transport = new StreamableHTTPClientTransport(new URL(resource), {
-    requestInit: { headers: { Authorization: `Bearer ${accessToken}` } },
+    requestInit: { headers: { Authorization: `${refreshed.token_type} ${accessToken}` } },
     fetch: async (url, options) => {
       const response = await fetchMcp(url, options);
-      if (options?.method === 'POST' && response.headers.get('content-type')?.startsWith('text/event-stream')) streamed = true;
+      const contentType = jsonResponses ? 'application/json' : 'text/event-stream';
+      if (options?.method === 'POST' && response.headers.get('content-type')?.startsWith(contentType)) expectedResponse = true;
       return response;
     },
   });
@@ -262,17 +272,50 @@ async function checkConnection(t, provider) {
   assert.ok(command.content.some(item => item.type === 'text' &&
     /^Process started with PID \d+[\s\S]*Initial output:\nDesktop Commander shell proof/.test(item.text)),
   JSON.stringify(command.content));
-  assert.ok(streamed, 'The MCP server sent SSE responses over Streamable HTTP');
-  t.diagnostic(`SSE initialize and tools/list (${tools.length} tools) succeeded. read_file returned the fixture and start_process ran a shell command.`);
+  assert.ok(expectedResponse, 'The MCP server used the expected Streamable HTTP response type');
+  t.diagnostic(`${jsonResponses ? 'JSON' : 'SSE'} initialize and tools/list (${tools.length} tools) succeeded. read_file returned the fixture and start_process ran a shell command.`);
+
+  if (jsonResponses) {
+    const stream = await fetchMcp(resource, {
+      headers: { Authorization: `Bearer ${accessToken}`, 'Mcp-Session-Id': transport.sessionId, Accept: 'text/event-stream' },
+    });
+    assert.equal(stream.status, 405);
+  }
 
   const sessionId = transport.sessionId;
   await transport.terminateSession();
   const ended = await fetchMcp(resource, {
-    headers: { Authorization: `Bearer ${accessToken}`, 'Mcp-Session-Id': sessionId, Accept: 'text/event-stream' },
+    method: 'POST',
+    headers: { Authorization: `Bearer ${accessToken}`, 'Mcp-Session-Id': sessionId, Accept: 'application/json, text/event-stream', 'Content-Type': 'application/json' },
+    body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list' }),
   });
   assert.equal(ended.status, 404);
+
+  if (gateway && gemini) {
+    gateway.stdin.write(`${JSON.stringify({ action: 'revoke', provider })}\n`);
+    while (true) {
+      const line = await events.next();
+      assert.ok(!line.done, 'Gateway stopped before revocation completed');
+      const event = JSON.parse(line.value);
+      if (event.type === 'log' && event.message.includes('Access revoked')) break;
+    }
+    const revoked = await fetchMcp(resource, { headers: { Authorization: `Bearer ${accessToken}` } });
+    assert.equal(revoked.status, 401);
+    const rejectedRefresh = await postForm(discovery.token_endpoint, {
+      client_id: clientId, client_secret: clientSecret, grant_type: 'refresh_token', refresh_token: tokens.refresh_token,
+    });
+    assert.equal((await rejectedRefresh.json()).error, 'invalid_grant');
+    assert.ok(await readFile(join(stateDir, 'chatgpt-oauth.json'), 'utf8') === JSON.stringify(otherClient, null, 2) + '\n');
+    const after = JSON.parse(await readFile(credentialPath, 'utf8'));
+    assert.ok(after.signingKey !== JSON.parse(credentialFile).signingKey);
+    assert.ok(after.clientSecret === clientSecret && after.loginPassword === loginPassword);
+    t.diagnostic('Revoking Gemini invalidated its access and refresh tokens while preserving ChatGPT credentials');
+  }
 }
 
 for (const [provider, name] of [['chatgpt', 'ChatGPT'], ['gemini', 'Gemini']]) {
-  test(`${name} OAuth and Desktop Commander Streamable HTTP`, { timeout: 60_000 }, t => checkConnection(t, provider));
+  for (const jsonResponses of externalUrl ? [externalJson] : [false, true]) {
+    test(`${name} OAuth and Desktop Commander Streamable HTTP (${jsonResponses ? 'JSON' : 'SSE'})`,
+      { timeout: 60_000 }, t => checkConnection(t, provider, jsonResponses));
+  }
 }

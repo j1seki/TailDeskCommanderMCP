@@ -3,6 +3,7 @@ name: TailDeskCommanderMCP packages
 on:
   push:
     branches: [main]
+    tags: ['desktop-v*']
   pull_request:
     branches: [main]
   workflow_dispatch:
@@ -29,6 +30,7 @@ jobs:
           - { platform: macos-x64, runner: macos-15-intel }
     env:
       PUPPETEER_SKIP_DOWNLOAD: 'true'
+      CARGO_BUILD_JOBS: '2'
     steps:
       - uses: actions/checkout@v5
         with:
@@ -53,6 +55,8 @@ jobs:
           npm run build
           npm --prefix desktop ci --no-audit
           npm --prefix desktop run prepare-runtime
+      - name: Compare the desktop type checks
+        run: npm --prefix desktop run typecheck:reference
       - name: Test OAuth and MCP
         run: node --test test/integration/chatgpt-mcp.js
       - name: Package AppImage
@@ -68,20 +72,14 @@ jobs:
         run: cargo test --locked --release --manifest-path desktop/src-tauri/Cargo.toml runtime::tests
       - name: Package macOS app
         if: runner.os == 'macOS'
-        run: |
-          npm --prefix desktop run tauri build -- --bundles app
-          app='desktop/src-tauri/target/release/bundle/macos/Desktop Commander Connect.app'
-          codesign --force --sign - "$app"
-          codesign --verify --strict "$app"
-          ditto -c -k --keepParent "$app" DesktopCommanderConnect-${{ matrix.platform }}.zip
+        run: npm --prefix desktop run tauri build -- --bundles app
+      - name: Name the release packages
+        run: node desktop/release.mjs stage ${{ matrix.platform }}
       - uses: actions/upload-artifact@v6
         with:
           name: desktop-commander-connect-${{ matrix.platform }}
           if-no-files-found: error
-          path: |
-            desktop/src-tauri/target/release/bundle/appimage/*.AppImage
-            desktop/src-tauri/target/release/desktop-commander-connect.exe
-            DesktopCommanderConnect-*.zip
+          path: desktop-release/*
 
   verified:
     name: Desktop packages verified
@@ -93,3 +91,52 @@ jobs:
         env:
           MATRIX_RESULT: ${{ needs.portable.result }}
         run: test "$MATRIX_RESULT" = success
+
+  publish:
+    name: Publish signed desktop release
+    needs: verified
+    if: github.ref_type == 'tag' && startsWith(github.ref_name, 'desktop-v') && github.repository == 'j1seki/TailDeskCommanderMCP'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '22'
+      - name: Validate the tag and prepare the signer
+        run: |
+          node desktop/release.mjs version "$GITHUB_REF_NAME"
+          npm --prefix desktop ci --no-audit
+          sudo apt-get update
+          sudo apt-get install -y minisign
+      - uses: actions/download-artifact@v7
+        with:
+          pattern: desktop-commander-connect-*
+          merge-multiple: true
+          path: desktop-release
+      - name: Sign and verify the exact packages from the matrix
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAILDESK_DESKTOP_SIGNING_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAILDESK_DESKTOP_SIGNING_PASSWORD }}
+        run: |
+          node desktop/release.mjs sign "$GITHUB_REPOSITORY"
+          cd desktop-release
+          sha256sum -c SHA256SUMS
+      - name: Upload all assets before publishing the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version=$(node desktop/release.mjs version "$GITHUB_REF_NAME")
+          if draft=$(gh release view "$GITHUB_REF_NAME" --json isDraft --jq .isDraft); then
+            if [ "$draft" != true ]; then
+              echo 'This desktop release has already been published.'
+              exit 1
+            fi
+          else
+            gh release create "$GITHUB_REF_NAME" --draft --verify-tag --generate-notes --title "TailDeskCommanderMCP Desktop v$version"
+          fi
+          gh release upload "$GITHUB_REF_NAME" desktop-release/* --clobber
+          gh release edit "$GITHUB_REF_NAME" --draft=false --latest

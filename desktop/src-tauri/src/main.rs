@@ -2,16 +2,17 @@
 
 mod runtime;
 mod settings;
+mod updates;
 
 use serde::{Deserialize, Serialize};
-use settings::Settings;
+use settings::{Settings, Tunnel};
 use std::{
     collections::VecDeque,
     fs,
-    io::{BufRead, BufReader},
+    io::{BufRead, BufReader, Write},
     path::PathBuf,
     process::{ChildStdin, Command, Stdio},
-    sync::Mutex,
+    sync::{LazyLock, Mutex},
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -26,7 +27,35 @@ const TAILSCALE_DOWNLOAD: &str = "https://tailscale.com/download";
 const TAILSCALE_FUNNEL: &str = "https://tailscale.com/docs/features/tailscale-funnel#enable-funnel";
 const CHATGPT_PLUGINS: &str = "https://chatgpt.com/plugins";
 const GEMINI: &str = "https://gemini.google.com/";
+const CLOUDFLARED: &str = "https://developers.cloudflare.com/tunnel/downloads/";
+const RELEASES: &str = "https://github.com/j1seki/TailDeskCommanderMCP/releases/latest";
 const MAX_ACTIVITY: usize = 300;
+
+#[derive(Clone, Copy, Default, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+enum Check {
+    #[default]
+    Waiting,
+    Passed,
+    Failed,
+}
+
+#[derive(Clone, Copy, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+enum Client {
+    Chatgpt,
+    Gemini,
+}
+
+#[derive(Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct Diagnostics {
+    https: Check,
+    chatgpt_oauth: Check,
+    chatgpt_mcp: Check,
+    gemini_oauth: Check,
+    gemini_mcp: Check,
+}
 
 #[derive(Clone, Copy, Default, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -44,6 +73,10 @@ enum Phase {
 struct Snapshot {
     phase: Phase,
     tailscale_installed: bool,
+    cloudflared_installed: bool,
+    version: String,
+    active_tunnel: Option<Tunnel>,
+    diagnostics: Diagnostics,
     can_hide: bool,
     url: Option<String>,
     client_id: Option<String>,
@@ -95,6 +128,11 @@ enum GatewayEvent {
     },
     Error {
         message: String,
+    },
+    Diagnostic {
+        component: String,
+        status: Check,
+        provider: Option<Client>,
     },
     Log {
         level: String,
@@ -169,7 +207,21 @@ fn find_tailscale() -> Option<PathBuf> {
     which::which("tailscale").ok()
 }
 
-fn worker(app: &AppHandle, tailscale: PathBuf, settings: Settings) -> Result<(), String> {
+fn find_cloudflared() -> Option<PathBuf> {
+    #[cfg(target_os = "macos")]
+    for path in [
+        "/usr/local/bin/cloudflared",
+        "/opt/homebrew/bin/cloudflared",
+    ] {
+        let path = PathBuf::from(path);
+        if path.is_file() {
+            return Some(path);
+        }
+    }
+    which::which("cloudflared").ok()
+}
+
+fn worker(app: &AppHandle, tunnel: PathBuf, settings: Settings) -> Result<(), String> {
     let runtime = runtime::prepare(app)?;
     let executable = if cfg!(windows) { "node.exe" } else { "node" };
     let mut command = Command::new(runtime.join(executable));
@@ -177,12 +229,19 @@ fn worker(app: &AppHandle, tailscale: PathBuf, settings: Settings) -> Result<(),
         .current_dir(&runtime)
         .arg(runtime.join("scripts").join("chatgpt-mcp.mjs"))
         .arg("--desktop")
-        .env("DC_CHATGPT_TAILSCALE", tailscale)
         .env("TAILSCALE_BE_CLI", "1")
         .env_remove("NODE_OPTIONS")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
+    match settings.tunnel {
+        Tunnel::Tailscale => command
+            .env("DC_MCP_TUNNEL", "tailscale")
+            .env("DC_CHATGPT_TAILSCALE", tunnel),
+        Tunnel::Cloudflare => command
+            .env("DC_MCP_TUNNEL", "cloudflare")
+            .env("DC_MCP_CLOUDFLARED", tunnel),
+    };
     if let Some(port) = settings.funnel_port {
         command.env("DC_CHATGPT_FUNNEL_PORT", port.to_string());
     } else {
@@ -250,7 +309,7 @@ fn worker(app: &AppHandle, tailscale: PathBuf, settings: Settings) -> Result<(),
                         &events_app,
                         &mut state,
                         "info",
-                        "Funnel",
+                        "Tunnel",
                         "The public HTTPS route is active.",
                     );
                 }
@@ -265,6 +324,21 @@ fn worker(app: &AppHandle, tailscale: PathBuf, settings: Settings) -> Result<(),
                     );
                 }
                 GatewayEvent::Error { message } => state.snapshot.message = Some(message),
+                GatewayEvent::Diagnostic {
+                    component,
+                    status,
+                    provider,
+                } => {
+                    let diagnostics = &mut state.snapshot.diagnostics;
+                    match (component.as_str(), provider) {
+                        ("https", None) => diagnostics.https = status,
+                        ("oauth", Some(Client::Chatgpt)) => diagnostics.chatgpt_oauth = status,
+                        ("oauth", Some(Client::Gemini)) => diagnostics.gemini_oauth = status,
+                        ("mcp", Some(Client::Chatgpt)) => diagnostics.chatgpt_mcp = status,
+                        ("mcp", Some(Client::Gemini)) => diagnostics.gemini_mcp = status,
+                        _ => continue,
+                    }
+                }
                 GatewayEvent::Log {
                     level,
                     source,
@@ -303,19 +377,28 @@ fn worker(app: &AppHandle, tailscale: PathBuf, settings: Settings) -> Result<(),
 fn gateway_state(app: AppHandle, managed: State<'_, GatewayState>) -> Snapshot {
     let mut state = managed.lock().unwrap();
     state.snapshot.tailscale_installed = find_tailscale().is_some();
+    state.snapshot.cloudflared_installed = find_cloudflared().is_some();
     notify(&app, &state);
     state.snapshot.clone()
 }
 
 #[tauri::command]
 fn start_gateway(app: AppHandle, managed: State<'_, GatewayState>) -> Result<(), String> {
-    let tailscale =
-        find_tailscale().ok_or("Install Tailscale and sign in on this computer first.")?;
     let mut state = managed.lock().unwrap();
     if !matches!(state.snapshot.phase, Phase::Stopped | Phase::Error) || state.quitting {
         return Ok(());
     }
+    let settings = state.snapshot.settings.clone();
+    let tunnel = match settings.tunnel {
+        Tunnel::Tailscale => {
+            find_tailscale().ok_or("Install Tailscale and sign in on this computer first.")?
+        }
+        Tunnel::Cloudflare => find_cloudflared()
+            .ok_or("Install cloudflared and put it on PATH, then reopen the app.")?,
+    };
     state.snapshot.phase = Phase::Starting;
+    state.snapshot.active_tunnel = Some(settings.tunnel);
+    state.snapshot.diagnostics = Diagnostics::default();
     state.snapshot.message = None;
     state.snapshot.setup_url = None;
     state.snapshot.url = None;
@@ -323,7 +406,6 @@ fn start_gateway(app: AppHandle, managed: State<'_, GatewayState>) -> Result<(),
     state.snapshot.gemini_client_id = None;
     state.credentials_path = None;
     state.gemini_credentials_path = None;
-    let settings = state.snapshot.settings.clone();
     record(
         &app,
         &mut state,
@@ -335,7 +417,7 @@ fn start_gateway(app: AppHandle, managed: State<'_, GatewayState>) -> Result<(),
     drop(state);
 
     thread::spawn(move || {
-        let result = worker(&app, tailscale, settings);
+        let result = worker(&app, tunnel, settings);
         let managed = app.state::<GatewayState>();
         let mut state = managed.lock().unwrap();
         let stopping = state.snapshot.phase == Phase::Stopping;
@@ -355,15 +437,41 @@ fn start_gateway(app: AppHandle, managed: State<'_, GatewayState>) -> Result<(),
         notify(&app, &state);
         drop(state);
         if quitting {
-            app.exit(0);
+            finish_exit(&app);
         }
     });
     Ok(())
 }
 
+fn finish_exit(app: &AppHandle) {
+    let app = app.clone();
+    thread::spawn(move || {
+        if let Err(error) = updates::install_on_exit(&app) {
+            let managed = app.state::<GatewayState>();
+            let mut state = managed.lock().unwrap();
+            state.quitting = false;
+            record(
+                &app,
+                &mut state,
+                "error",
+                "Updates",
+                format!("Update installation failed. {error}"),
+            );
+            notify(&app, &state);
+            drop(state);
+            show_window(&app);
+            return;
+        }
+        app.exit(0);
+    });
+}
+
 fn stop(app: &AppHandle, quitting: bool) {
     let managed = app.state::<GatewayState>();
     let mut state = managed.lock().unwrap();
+    if state.quitting {
+        return;
+    }
     state.quitting |= quitting;
     if matches!(
         state.snapshot.phase,
@@ -376,20 +484,39 @@ fn stop(app: &AppHandle, quitting: bool) {
                 &mut state,
                 "info",
                 "App",
-                "Stopping the connection and closing Funnel.",
+                "Stopping the connection and closing the tunnel.",
             );
         }
         state.child_input.take();
         notify(app, &state);
     } else if quitting {
         drop(state);
-        app.exit(0);
+        finish_exit(app);
     }
 }
 
 #[tauri::command]
 fn stop_gateway(app: AppHandle) {
     stop(&app, false);
+}
+
+#[tauri::command]
+fn quit_app(app: AppHandle) {
+    stop(&app, true);
+}
+
+#[tauri::command]
+fn revoke_client(managed: State<'_, GatewayState>, provider: Client) -> Result<(), String> {
+    let mut state = managed.lock().unwrap();
+    if state.snapshot.phase != Phase::Running {
+        return Err("Start the connection before revoking access.".into());
+    }
+    let child = state
+        .child_input
+        .as_mut()
+        .ok_or("The connection is closing.")?;
+    let message = serde_json::json!({ "action": "revoke", "provider": provider });
+    writeln!(child, "{message}").map_err(|_| "Could not reach the gateway.".into())
 }
 
 #[tauri::command]
@@ -443,10 +570,8 @@ fn copy_value(app: AppHandle, managed: State<'_, GatewayState>, field: &str) -> 
                             .ok()
                     })
                     .unwrap_or_default();
-                    format!(
-                        "{date} [{}] {}: {}",
-                        entry.level, entry.source, entry.message
-                    )
+                    let message = redact_activity(&entry.message);
+                    format!("{date} [{}] {}: {}", entry.level, entry.source, message)
                 })
                 .collect::<Vec<_>>()
                 .join("\n"),
@@ -477,6 +602,25 @@ fn copy_value(app: AppHandle, managed: State<'_, GatewayState>, field: &str) -> 
     app.clipboard().write_text(value).map_err(|e| e.to_string())
 }
 
+fn redact_activity(message: &str) -> String {
+    static PRIVATE: LazyLock<regex::Regex> = LazyLock::new(|| {
+        regex::Regex::new(
+        r#"(?i)https?://[^\s<>\"']+|(?:[a-z0-9-]+\.)+(?:ts\.net|trycloudflare\.com)\b|\b[a-z0-9_-]{32,}(?:\.[a-z0-9_-]+)*\b"#,
+    ).unwrap()
+    });
+    PRIVATE.replace_all(message, "[redacted]").into_owned()
+}
+
+#[cfg(test)]
+#[test]
+fn redacts_urls_tunnel_hosts_and_credential_shaped_values() {
+    let message = "https://demo.example.ts.net/mcp on temporary.trycloudflare.com uses P9gRnCH70ROwNN7CL5D6Qw1IkX98YS77lc9nUvbnvjg";
+    assert_eq!(
+        redact_activity(message),
+        "[redacted] on [redacted] uses [redacted]"
+    );
+}
+
 #[tauri::command]
 fn open_link(managed: State<'_, GatewayState>, link: &str) -> Result<(), String> {
     let state = managed.lock().unwrap();
@@ -485,6 +629,8 @@ fn open_link(managed: State<'_, GatewayState>, link: &str) -> Result<(), String>
         "funnel" => TAILSCALE_FUNNEL,
         "chatgpt" => CHATGPT_PLUGINS,
         "gemini" => GEMINI,
+        "cloudflared" => CLOUDFLARED,
+        "releases" => RELEASES,
         "enable" => state
             .snapshot
             .setup_url
@@ -526,19 +672,31 @@ fn show_window(app: &AppHandle) {
 }
 
 fn main() {
+    #[cfg(windows)]
+    if let Some(code) = updates::run_portable_helper() {
+        std::process::exit(code);
+    }
     tauri::Builder::default()
         .manage(GatewayState::default())
+        .manage(updates::StateLock::default())
         .plugin(tauri_plugin_clipboard_manager::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .invoke_handler(tauri::generate_handler![
             gateway_state,
             start_gateway,
             stop_gateway,
+            quit_app,
+            revoke_client,
             update_settings,
             gateway_activity,
             clear_activity,
             copy_value,
             open_link,
-            hide_window
+            hide_window,
+            updates::update_status,
+            updates::check_updates,
+            updates::download_update,
+            updates::cancel_update
         ])
         .setup(|app| {
             let show =
@@ -572,6 +730,8 @@ fn main() {
             let mut state = managed.lock().unwrap();
             state.snapshot.can_hide = tray.is_ok();
             state.snapshot.tailscale_installed = find_tailscale().is_some();
+            state.snapshot.cloudflared_installed = find_cloudflared().is_some();
+            state.snapshot.version = app.package_info().version.to_string();
             match app
                 .path()
                 .app_config_dir()
@@ -587,6 +747,13 @@ fn main() {
                     format!("Saved settings could not be loaded. Using defaults. {error}"),
                 ),
             }
+            #[cfg(windows)]
+            if let Some(message) = updates::clean_portable_helpers() {
+                record(app.handle(), &mut state, "warning", "Updates", message);
+            }
+            if state.snapshot.settings.auto_check_updates {
+                updates::check_on_startup(app.handle().clone());
+            }
             Ok(())
         })
         .on_window_event(|window, event| {
@@ -594,16 +761,11 @@ fn main() {
                 let managed = window.app_handle().state::<GatewayState>();
                 let state = managed.lock().unwrap();
                 let hide = state.snapshot.can_hide && state.snapshot.settings.close_to_tray;
-                let busy = matches!(
-                    state.snapshot.phase,
-                    Phase::Running | Phase::Starting | Phase::Stopping
-                );
                 drop(state);
+                api.prevent_close();
                 if hide {
-                    api.prevent_close();
                     let _ = window.hide();
-                } else if busy {
-                    api.prevent_close();
+                } else {
                     stop(window.app_handle(), true);
                 }
             }
