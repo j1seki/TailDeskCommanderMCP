@@ -637,7 +637,7 @@ dependencies = [
 
 [[package]]
 name = "desktop-commander-connect"
-version = "0.3.5"
+version = "0.3.6"
 dependencies = [
  "flate2",
  "serde",

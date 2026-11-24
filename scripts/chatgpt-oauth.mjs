@@ -8,10 +8,11 @@ export const SCOPE = 'desktop-commander';
 export const RESOURCE_METADATA_PATH = '/.well-known/oauth-protected-resource/mcp';
 const AUTH_METADATA_PATH = '/.well-known/oauth-authorization-server';
 const CHATGPT_CALLBACK = 'https://chatgpt.com/connector_platform_oauth_redirect';
+// Gemini Connected Apps uses Google-managed relay URLs generated for each connection.
+const GEMINI_CALLBACK = /^https:\/\/oauth-redirect\.googleusercontent\.com\/[ra]\/[A-Za-z0-9_-]+$/;
 const CODE_LIFETIME = 5 * 60;
 const ACCESS_LIFETIME = 60 * 60;
 const REFRESH_LIFETIME = 30 * 24 * 60 * 60;
-const CLIENT_ID = 'desktop-commander-chatgpt';
 const PKCE_VERIFIER = /^[A-Za-z0-9._~-]{43,128}$/;
 const BASE64_SECRET = /^[A-Za-z0-9_-]{43}$/;
 
@@ -23,7 +24,8 @@ function secretMatches(value, expected) {
   return typeof value === 'string' && timingSafeEqual(Buffer.from(digest(value)), Buffer.from(digest(expected)));
 }
 
-export async function loadCredentials() {
+export async function loadCredentials(provider = 'chatgpt') {
+  const clientId = `desktop-commander-${provider}`;
   const windows = process.platform === 'win32';
   const configHome = windows
     ? process.env.LOCALAPPDATA || join(homedir(), 'AppData', 'Local')
@@ -36,7 +38,7 @@ export async function loadCredentials() {
     throw new Error(`OAuth state directory must be owned by you and private (0700): ${directory}`);
   }
 
-  const path = join(directory, 'chatgpt-oauth.json');
+  const path = join(directory, `${provider}-oauth.json`);
   async function readCredentials() {
     if (windows && !(await lstat(path)).isFile()) throw new Error(`Expected a regular OAuth credentials file: ${path}`);
     const file = await open(path, constants.O_RDONLY | (windows ? 0 : constants.O_NOFOLLOW | constants.O_NONBLOCK));
@@ -46,12 +48,12 @@ export async function loadCredentials() {
         throw new Error(`OAuth credentials must be in a private regular file (0600): ${path}`);
       }
       const credentials = JSON.parse(await file.readFile('utf8'));
-      if (credentials?.clientId !== CLIENT_ID ||
+      if (credentials?.clientId !== clientId ||
         !['clientSecret', 'loginPassword', 'signingKey'].every(key =>
           typeof credentials[key] === 'string' && BASE64_SECRET.test(credentials[key]))) {
         throw new Error(`Invalid OAuth credentials file: ${path}`);
       }
-      const { clientId, clientSecret, loginPassword, signingKey } = credentials;
+      const { clientSecret, loginPassword, signingKey } = credentials;
       return { path, clientId, clientSecret, loginPassword, signingKey };
     } finally {
       await file.close();
@@ -66,7 +68,7 @@ export async function loadCredentials() {
 
   const temporary = join(directory, `.oauth-${randomSecret()}`);
   await writeFile(temporary, JSON.stringify({
-    clientId: CLIENT_ID,
+    clientId,
     clientSecret: randomSecret(),
     loginPassword: randomSecret(),
     signingKey: randomSecret(),
@@ -116,11 +118,11 @@ async function readForm(request) {
   return fields;
 }
 
-function showLogin(response, incorrect = false) {
+function showLogin(response, client, incorrect = false) {
   response.writeHead(incorrect ? 401 : 200, {
     'Content-Type': 'text/html; charset=utf-8',
     'Cache-Control': 'no-store',
-    'Content-Security-Policy': "default-src 'none'; style-src 'unsafe-inline'; form-action 'self' https://chatgpt.com; frame-ancestors 'none'; base-uri 'none'",
+    'Content-Security-Policy': `default-src 'none'; style-src 'unsafe-inline'; form-action 'self'${client.gemini ? '' : ' https://chatgpt.com'}; frame-ancestors 'none'; base-uri 'none'`,
     'Referrer-Policy': 'same-origin',
   });
   response.end(`<!doctype html>
@@ -135,7 +137,7 @@ function showLogin(response, incorrect = false) {
   button { padding: .55rem .85rem; margin-right: .4rem }
 </style>
 <h1>Authorize Desktop Commander</h1>
-<p>Allow ChatGPT to use the file and terminal tools on this machine.</p>
+<p>Allow ${client.gemini ? 'Gemini' : 'ChatGPT'} to use the file and terminal tools on this machine.</p>
 ${incorrect ? '<p role="alert">Incorrect login password.</p>' : ''}
 <form method="post">
   <label for="password">Desktop Commander login password</label>
@@ -146,7 +148,26 @@ ${incorrect ? '<p role="alert">Incorrect login password.</p>' : ''}
 </html>`);
 }
 
-export function createOAuth(issuer, credentials) {
+function finishAuthorization(response, callback, showContinuation) {
+  const headers = { 'Cache-Control': 'no-store', 'Referrer-Policy': 'no-referrer' };
+  if (!showContinuation) {
+    response.writeHead(303, { ...headers, Location: callback.href });
+    return response.end();
+  }
+  // A browser can apply the form's CSP to each HTTP redirect in Google's relay chain.
+  // Start a separate navigation after the same-origin form submission has completed.
+  const href = callback.href.replaceAll('&', '&amp;').replaceAll('"', '&quot;');
+  response.writeHead(200, {
+    ...headers, 'Content-Type': 'text/html; charset=utf-8',
+    'Content-Security-Policy': "default-src 'none'; frame-ancestors 'none'; base-uri 'none'",
+  });
+  response.end(`<!doctype html>
+<html lang="en"><meta charset="utf-8"><title>Return to Gemini</title>
+<meta http-equiv="refresh" content="0; URL=${href}">
+<p><a href="${href}">Return to Gemini</a></p></html>`);
+}
+
+export function createOAuth(issuer, chatgpt, gemini) {
   const resource = `${issuer}/mcp`;
   const redirects = new Set([CHATGPT_CALLBACK]);
   const extraRedirect = process.env.DC_CHATGPT_REDIRECT_URI;
@@ -156,25 +177,29 @@ export function createOAuth(issuer, credentials) {
     }
     redirects.add(extraRedirect);
   }
+  const clients = new Map([
+    [chatgpt.clientId, { ...chatgpt, gemini: false }],
+    [gemini.clientId, { ...gemini, gemini: true }],
+  ]);
   const codes = new Map();
-  const sign = value => createHmac('sha256', Buffer.from(credentials.signingKey, 'base64url'))
+  const sign = (client, value) => createHmac('sha256', Buffer.from(client.signingKey, 'base64url'))
     .update(value).digest('base64url');
 
-  function mintToken(type, lifetime) {
+  function mintToken(client, type, lifetime) {
     const payload = Buffer.from(JSON.stringify({
-      type, issuer, resource, client: credentials.clientId, scope: SCOPE,
+      type, issuer, resource, client: client.clientId, scope: SCOPE,
       expires: now() + lifetime, id: randomSecret(),
     })).toString('base64url');
-    return `${payload}.${sign(payload)}`;
+    return `${payload}.${sign(client, payload)}`;
   }
 
-  function verifyToken(token, type) {
+  function verifyToken(client, token, type) {
     if (typeof token !== 'string' || token.length > 2048) return false;
     const [payload, signature, extra] = token.split('.');
-    if (!signature || extra !== undefined || !secretMatches(signature, sign(payload))) return false;
+    if (!signature || extra !== undefined || !secretMatches(signature, sign(client, payload))) return false;
     const grant = JSON.parse(Buffer.from(payload, 'base64url').toString('utf8'));
     return grant.type === type && grant.issuer === issuer && grant.resource === resource &&
-      grant.client === credentials.clientId && grant.scope === SCOPE && grant.expires > now();
+      grant.client === client.clientId && grant.scope === SCOPE && grant.expires > now();
   }
 
   function acceptsScope(scope) {
@@ -182,9 +207,10 @@ export function createOAuth(issuer, credentials) {
   }
 
   async function authorize(request, response, query) {
+    const client = clients.get(query.get('client_id'));
     const redirectUri = query.get('redirect_uri');
-    if (new Set(query.keys()).size !== query.size || query.get('client_id') !== credentials.clientId ||
-      !redirects.has(redirectUri)) {
+    if (new Set(query.keys()).size !== query.size || !client ||
+      !(client.gemini ? GEMINI_CALLBACK.test(redirectUri ?? '') : redirects.has(redirectUri))) {
       return sendJson(response, 400, { error: 'invalid_request' });
     }
     const state = query.get('state');
@@ -193,8 +219,7 @@ export function createOAuth(issuer, credentials) {
       callback.searchParams.set(key, value);
       callback.searchParams.set('iss', issuer);
       if (state !== null) callback.searchParams.set('state', state);
-      response.writeHead(303, { Location: callback.href, 'Cache-Control': 'no-store', 'Referrer-Policy': 'no-referrer' });
-      response.end();
+      return finishAuthorization(response, callback, client.gemini && request.method === 'POST');
     }
 
     if (query.get('response_type') !== 'code') return redirect('error', 'unsupported_response_type');
@@ -202,20 +227,23 @@ export function createOAuth(issuer, credentials) {
     if (query.get('code_challenge_method') !== 'S256' || !BASE64_SECRET.test(challenge ?? '')) {
       return redirect('error', 'invalid_request');
     }
-    if (query.get('resource') !== resource) return redirect('error', 'invalid_target');
+    const requestedResource = query.get('resource');
+    if (requestedResource !== resource && !(client.gemini && requestedResource === null)) {
+      return redirect('error', 'invalid_target');
+    }
     if (!acceptsScope(query.get('scope'))) return redirect('error', 'invalid_scope');
-    if (request.method === 'GET') return showLogin(response);
+    if (request.method === 'GET') return showLogin(response, client);
     if (request.headers.origin && request.headers.origin !== issuer) throw new HttpError(403, 'Invalid Origin');
 
     const form = await readForm(request);
     if (form.get('action') === 'deny') return redirect('error', 'access_denied');
-    if (!secretMatches(form.get('password'), credentials.loginPassword)) return showLogin(response, true);
+    if (!secretMatches(form.get('password'), client.loginPassword)) return showLogin(response, client, true);
     for (const [key, grant] of codes) {
       if (grant.expires <= now()) codes.delete(key);
     }
     if (codes.size >= 128) return redirect('error', 'temporarily_unavailable');
     const code = randomSecret();
-    codes.set(digest(code), { challenge, redirectUri, expires: now() + CODE_LIFETIME });
+    codes.set(digest(code), { clientId: client.clientId, challenge, redirectUri, expires: now() + CODE_LIFETIME });
     return redirect('code', code);
   }
 
@@ -234,13 +262,14 @@ export function createOAuth(issuer, credentials) {
       clientId = basicId;
       secret = basicSecret;
     }
-    if (clientId !== credentials.clientId || !secretMatches(secret, credentials.clientSecret)) {
+    const client = clients.get(clientId);
+    if (!client || !secretMatches(secret, client.clientSecret)) {
       if (auth) response.setHeader('WWW-Authenticate', 'Basic realm="Desktop Commander"');
       return sendJson(response, 401, { error: 'invalid_client' });
     }
     const grantType = form.get('grant_type');
     const requestedResource = form.get('resource');
-    if (requestedResource !== resource && !(grantType === 'refresh_token' && requestedResource === null)) {
+    if (requestedResource !== resource && !(requestedResource === null && (client.gemini || grantType === 'refresh_token'))) {
       return sendJson(response, 400, { error: 'invalid_target' });
     }
 
@@ -250,28 +279,31 @@ export function createOAuth(issuer, credentials) {
         const key = digest(form.get('code') ?? '');
         const grant = codes.get(key);
         const verifier = form.get('code_verifier') ?? '';
-        if (!grant || grant.expires <= now() || grant.redirectUri !== form.get('redirect_uri') ||
+        if (!grant || grant.clientId !== client.clientId || grant.expires <= now() || grant.redirectUri !== form.get('redirect_uri') ||
           !PKCE_VERIFIER.test(verifier) || !secretMatches(digest(verifier), grant.challenge)) {
           return sendJson(response, 400, { error: 'invalid_grant' });
         }
         codes.delete(key);
-        tokens.refresh_token = mintToken('refresh', REFRESH_LIFETIME);
+        tokens.refresh_token = mintToken(client, 'refresh', REFRESH_LIFETIME);
         break;
       }
       case 'refresh_token':
-        if (!verifyToken(form.get('refresh_token'), 'refresh')) return sendJson(response, 400, { error: 'invalid_grant' });
+        if (!verifyToken(client, form.get('refresh_token'), 'refresh')) return sendJson(response, 400, { error: 'invalid_grant' });
         if (!acceptsScope(form.get('scope'))) return sendJson(response, 400, { error: 'invalid_scope' });
         break;
       default:
         return sendJson(response, 400, { error: 'unsupported_grant_type' });
     }
-    return sendJson(response, 200, { ...tokens, access_token: mintToken('access', ACCESS_LIFETIME) });
+    return sendJson(response, 200, { ...tokens, access_token: mintToken(client, 'access', ACCESS_LIFETIME) });
   }
 
   return {
     authorizeMcp(request, response) {
       const authorization = request.headers.authorization;
-      if (verifyToken(/^Bearer (\S+)$/i.exec(authorization ?? '')?.[1], 'access')) return true;
+      const token = /^Bearer (\S+)$/i.exec(authorization ?? '')?.[1];
+      for (const client of clients.values()) {
+        if (verifyToken(client, token, 'access')) return true;
+      }
       const error = authorization ? ', error="invalid_token"' : '';
       response.setHeader('WWW-Authenticate', `Bearer resource_metadata="${issuer}${RESOURCE_METADATA_PATH}", scope="${SCOPE}"${error}`);
       sendJson(response, 401, { error: authorization ? 'invalid_token' : 'authentication_required' });

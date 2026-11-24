@@ -210,7 +210,7 @@ async function main() {
     throw new Error('DC_CHATGPT_LOCAL_PORT must be a TCP port number or 0 for automatic assignment.');
   }
   const funnel = local ? undefined : await getFunnelAddress();
-  const credentials = await loadCredentials();
+  const [chatgpt, gemini] = await Promise.all([loadCredentials(), loadCredentials('gemini')]);
   let issuer, oauth, bridge, tunnel;
   let stopping = false;
 
@@ -267,17 +267,22 @@ async function main() {
     await once(server, 'listening');
     const localPort = server.address().port;
     issuer = funnel?.issuer ?? `http://127.0.0.1:${localPort}`;
-    oauth = createOAuth(issuer, credentials);
+    oauth = createOAuth(issuer, chatgpt, gemini);
     bridge = createMcpBridge(oauth);
 
     if (desktop) {
-      emit('gateway', { url: `${issuer}/mcp`, credentialsPath: credentials.path, clientId: credentials.clientId });
+      emit('gateway', {
+        url: `${issuer}/mcp`, credentialsPath: chatgpt.path, clientId: chatgpt.clientId,
+        geminiCredentialsPath: gemini.path, geminiClientId: gemini.clientId,
+      });
       log('MCP', `OAuth gateway listening on loopback port ${localPort}.`);
     } else {
       console.log(`MCP URL: ${issuer}/mcp`);
       console.log('Authentication: OAuth');
-      console.log(`OAuth client ID: ${credentials.clientId}`);
-      console.log(`OAuth client secret and login password: ${credentials.path}`);
+      console.log(`OAuth client ID: ${chatgpt.clientId}`);
+      console.log(`OAuth client secret and login password: ${chatgpt.path}`);
+      console.log(`Gemini OAuth client ID: ${gemini.clientId}`);
+      console.log(`Gemini OAuth client secret and login password: ${gemini.path}`);
     }
 
     if (funnel) {
@@ -311,6 +316,6 @@ async function main() {
 
 main().catch(error => {
   if (desktop) emit('error', { message: redactSetupLinks(error.message).slice(0, 1600) });
-  else console.error(`Could not start ChatGPT MCP: ${error.message}`);
+  else console.error(`Could not start MCP gateway: ${error.message}`);
   process.exitCode = 1;
 });

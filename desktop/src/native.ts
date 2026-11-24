@@ -16,6 +16,7 @@ export interface GatewayState {
   canHide: boolean;
   url: string | null;
   clientId: string | null;
+  geminiClientId: string | null;
   setupUrl: string | null;
   message: string | null;
   startedAt: number | null;
@@ -30,8 +31,9 @@ export interface ActivityEntry {
   message: string;
 }
 
-export type CopyField = 'url' | 'clientId' | 'clientSecret' | 'loginPassword' | 'activity' | 'operator';
-export type Destination = 'tailscale' | 'funnel' | 'chatgpt' | 'enable';
+export type CopyField = 'url' | 'clientId' | 'clientSecret' | 'loginPassword' |
+  'geminiClientId' | 'geminiClientSecret' | 'geminiLoginPassword' | 'activity' | 'operator';
+export type Destination = 'tailscale' | 'funnel' | 'chatgpt' | 'gemini' | 'enable';
 
 export const native = {
   state: () => invoke<GatewayState>('gateway_state'),

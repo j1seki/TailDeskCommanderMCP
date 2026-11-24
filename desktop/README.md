@@ -2,16 +2,20 @@
 
 The Rust and TypeScript app packages Desktop Commander, Node, the OAuth gateway, and ripgrep inside the application. On first use it unpacks those files into your local app data. Tailscale remains a separate install. The app uses your computer's signed-in Tailscale client and its Funnel permission.
 
-## Set up ChatGPT
+## Set up ChatGPT or Gemini
 
 1. Install Tailscale on the computer you want to control and sign in there. [Tailscale downloads](https://tailscale.com/download)
 2. Start Desktop Commander Connect and choose **Start connection**. If prompted, approve Funnel for this device and retry. Linux may require granting your account Tailscale operator permission once. The app shows a copyable terminal command when this is needed. [Tailscale Funnel setup](https://tailscale.com/docs/features/tailscale-funnel#enable-funnel)
-3. In ChatGPT, open **Plugins → Add custom MCP server** and paste the **Server URL**. Select **OAuth**, then copy the **OAuth client ID** and **OAuth client secret** into the corresponding fields. [ChatGPT setup](https://developers.openai.com/api/docs/guides/custom-mcp-server)
-4. When the Desktop Commander sign-in page opens, paste the **Login password** and select **Authorize**.
+3. Open **Client setup**, select your client, and use the copy buttons to enter that client's values.
+   - **ChatGPT** — Open **Plugins → Add custom MCP server** and paste the **Server URL**. Select **OAuth**, then enter the **OAuth client ID** and **OAuth client secret**. [ChatGPT setup](https://developers.openai.com/api/docs/guides/custom-mcp-server)
+   - **Gemini** — In the Gemini web app, open **Settings → Connected Apps → Custom apps** and enter the **Server URL**. Under **Advanced features → Show more**, enter the Gemini **OAuth client ID** and **OAuth client secret**. [Gemini eligibility and setup](https://support.google.com/gemini/answer/17209137)
+4. When the Desktop Commander sign-in page opens, paste the **Login password** for the selected client and select **Authorize**.
 
-You can use ChatGPT on another device while the app runs on the computer it controls. **Hide to tray** keeps the connection active. Open the app again or stop the connection from the tray menu. **Quit** shuts down the server and its foreground Funnel route. Tray availability on Linux depends on desktop support for AppIndicator.
+You can use ChatGPT or Gemini on another device while the app runs on the computer it controls. **Hide to tray** keeps the connection active. Open the app again or stop the connection from the tray menu. **Quit** shuts down the server and its foreground Funnel route. Tray availability on Linux depends on desktop support for AppIndicator.
 
-Use **Overview** to start and stop the endpoint, **ChatGPT setup** for the steps and copy buttons, and **Activity** to search, filter, or copy recent connection logs. Activity keeps a rolling history for the current app session. **Settings** saves your preferred public Funnel port, a custom ChatGPT callback URL if one is required, and whether closing the window hides it in the tray. Connection preferences apply on the next start.
+Use **Overview** to start and stop the endpoint, **Client setup** for the steps and copy buttons, and **Activity** to search, filter, or copy recent connection logs. Activity keeps a rolling history for the current app session. **Settings** saves your preferred public Funnel port, a custom ChatGPT callback URL if one is required, and whether closing the window hides it in the tray. Connection preferences apply on the next start.
+
+An existing ChatGPT connection can keep using its saved credentials after upgrading. Use the same public Funnel URL. Gemini has its own credentials and uses the same server URL.
 
 If you used the shell launcher earlier, stop it before starting the desktop app to reuse its available Funnel port. On macOS and Linux the app uses the same default OAuth credentials as the shell launcher. On Windows it saves OAuth credentials under `%LOCALAPPDATA%\desktop-commander`.
 

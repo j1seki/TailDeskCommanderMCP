@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
-import { createHash, randomBytes } from 'node:crypto';
+import { createHash, createHmac, randomBytes } from 'node:crypto';
 import { once } from 'node:events';
 import { mkdtemp, mkdir, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { request } from 'node:https';
@@ -13,7 +13,10 @@ import { fileURLToPath } from 'node:url';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 
-const callback = 'https://chatgpt.com/connector_platform_oauth_redirect';
+const callbacks = {
+  chatgpt: 'https://chatgpt.com/connector_platform_oauth_redirect',
+  gemini: 'https://oauth-redirect.googleusercontent.com/r/user_bound_custom-mcp-test',
+};
 const publicRelay = process.env.DC_CHATGPT_TEST_RELAY;
 const externalUrl = process.env.DC_CHATGPT_TEST_URL;
 const windows = process.platform === 'win32';
@@ -39,18 +42,33 @@ function fetchMcp(url, options = {}) {
   });
 }
 
-test('ChatGPT OAuth and Desktop Commander Streamable HTTP', { timeout: 60_000 }, async t => {
+async function checkConnection(t, provider) {
+  const gemini = provider === 'gemini';
+  const callback = callbacks[provider];
+  const otherProvider = gemini ? 'chatgpt' : 'gemini';
   const dir = await mkdtemp(join(tmpdir(), 'desktop-commander-chatgpt-'));
   let stopGateway;
   t.after(async () => {
     await stopGateway?.();
     await rm(dir, { force: true, recursive: true });
   });
-  const stateDir = process.env.DC_CHATGPT_TEST_STATE_DIR || join(dir, 'oauth');
+  const stateDir = (externalUrl && process.env.DC_CHATGPT_TEST_STATE_DIR) || join(dir, 'oauth');
+  const credentialPath = join(stateDir, `${provider}-oauth.json`);
+  let existingCredentials;
   let base = externalUrl;
   if (!base) {
     const testHome = join(dir, 'home');
     await mkdir(testHome);
+    if (!gemini) {
+      existingCredentials = {
+        clientId: 'desktop-commander-chatgpt',
+        clientSecret: randomBytes(32).toString('base64url'),
+        loginPassword: randomBytes(32).toString('base64url'),
+        signingKey: randomBytes(32).toString('base64url'),
+      };
+      await mkdir(stateDir, { mode: 0o700 });
+      await writeFile(credentialPath, JSON.stringify(existingCredentials), { mode: 0o600 });
+    }
     const entry = fileURLToPath(new URL('../../scripts/chatgpt-mcp.mjs', import.meta.url));
     const gateway = spawn(process.execPath, [entry, '--local', '--desktop'], {
       env: {
@@ -77,6 +95,7 @@ test('ChatGPT OAuth and Desktop Commander Streamable HTTP', { timeout: 60_000 },
   }
 
   const resource = `${base}/mcp`;
+  const resourceParameter = gemini ? {} : { resource };
   const response = await fetchMcp(resource);
   assert.equal(response.status, 401);
   const unauthorizedPost = await fetchMcp(resource, { method: 'POST' });
@@ -94,14 +113,19 @@ test('ChatGPT OAuth and Desktop Commander Streamable HTTP', { timeout: 60_000 },
   assert.deepEqual(discovery.code_challenge_methods_supported, ['S256']);
   t.diagnostic(`401 OAuth challenge and discovery verified at ${resource}${publicRelay ? ` via public relay ${publicRelay}` : ''}`);
 
-  const credentialPath = join(stateDir, 'chatgpt-oauth.json');
   if (!windows) assert.equal((await stat(credentialPath)).mode & 0o777, 0o600);
-  const { clientId, clientSecret, loginPassword } = JSON.parse(await readFile(credentialPath, 'utf8'));
+  const credentialFile = await readFile(credentialPath, 'utf8');
+  if (existingCredentials) {
+    assert.ok(credentialFile === JSON.stringify(existingCredentials), 'The existing ChatGPT credentials file was preserved');
+  }
+  const { clientId, clientSecret, loginPassword } = JSON.parse(credentialFile);
+  const otherClient = JSON.parse(await readFile(join(stateDir, `${otherProvider}-oauth.json`), 'utf8'));
+  const state = gemini ? '<&"opaque-state>'.repeat(90) : 'integration-state';
   const verifier = randomBytes(48).toString('base64url');
   const authorization = new URL(discovery.authorization_endpoint);
   authorization.search = new URLSearchParams({
-    client_id: clientId, response_type: 'code', redirect_uri: callback, resource,
-    scope: 'desktop-commander', state: 'integration-state', code_challenge_method: 'S256',
+    client_id: clientId, response_type: 'code', redirect_uri: callback, ...resourceParameter,
+    scope: 'desktop-commander', state, code_challenge_method: 'S256',
     code_challenge: createHash('sha256').update(verifier).digest('base64url'),
   });
 
@@ -110,10 +134,12 @@ test('ChatGPT OAuth and Desktop Commander Streamable HTTP', { timeout: 60_000 },
   const untrusted = await fetchMcp(invalidRedirect, { redirect: 'manual' });
   assert.equal(untrusted.status, 400);
   assert.equal(untrusted.headers.get('location'), null);
+  invalidRedirect.searchParams.set('redirect_uri', callbacks[otherProvider]);
+  assert.equal((await fetchMcp(invalidRedirect)).status, 400);
 
   const loginPage = await fetchMcp(authorization);
   assert.equal(loginPage.status, 200);
-  assert.match(await loginPage.text(), /Authorize Desktop Commander/);
+  assert.ok((await loginPage.text()).includes(`Allow ${gemini ? 'Gemini' : 'ChatGPT'} to use`));
   function postForm(url, fields, headers = {}) {
     return fetchMcp(url, {
       method: 'POST', redirect: 'manual',
@@ -121,26 +147,39 @@ test('ChatGPT OAuth and Desktop Commander Streamable HTTP', { timeout: 60_000 },
       body: new URLSearchParams(fields),
     });
   }
-  const badLogin = await postForm(authorization, { password: 'wrong' }, { Origin: base });
+  const badLogin = await postForm(authorization, { password: otherClient.loginPassword }, { Origin: base });
   assert.equal(badLogin.status, 401);
   assert.equal(badLogin.headers.get('location'), null);
+  async function callbackFrom(response) {
+    if (!gemini) {
+      assert.equal(response.status, 303);
+      return new URL(response.headers.get('location'));
+    }
+    assert.equal(response.status, 200);
+    assert.equal(response.headers.get('location'), null);
+    assert.equal(response.headers.get('referrer-policy'), 'no-referrer');
+    const html = await response.text();
+    const navigation = html.match(/<meta http-equiv="refresh" content="0; URL=([^"]+)">/)?.[1];
+    assert.ok(navigation);
+    assert.ok(html.includes(`href="${navigation}">Return to Gemini</a>`));
+    return new URL(navigation.replaceAll('&amp;', '&'));
+  }
   const denied = await postForm(authorization, { action: 'deny' }, { Origin: base });
-  const denial = new URL(denied.headers.get('location'));
+  const denial = await callbackFrom(denied);
   assert.equal(denial.searchParams.get('error'), 'access_denied');
   assert.equal(denial.searchParams.get('iss'), base);
 
   const approved = await postForm(authorization, { password: loginPassword }, { Origin: base });
-  assert.equal(approved.status, 303);
-  const redirect = new URL(approved.headers.get('location'));
+  const redirect = await callbackFrom(approved);
   assert.equal(redirect.origin + redirect.pathname, callback);
-  assert.equal(redirect.searchParams.get('state'), 'integration-state');
+  assert.equal(redirect.searchParams.get('state'), state);
   assert.equal(redirect.searchParams.get('iss'), base);
   const code = redirect.searchParams.get('code');
   assert.ok(code);
 
   const exchange = {
     client_id: clientId, client_secret: clientSecret, grant_type: 'authorization_code',
-    code, code_verifier: verifier, redirect_uri: callback, resource,
+    code, code_verifier: verifier, redirect_uri: callback, ...resourceParameter,
   };
   const badClient = await postForm(discovery.token_endpoint, { ...exchange, client_secret: 'wrong' });
   assert.equal(badClient.status, 401);
@@ -148,6 +187,10 @@ test('ChatGPT OAuth and Desktop Commander Streamable HTTP', { timeout: 60_000 },
   assert.equal((await badTarget.json()).error, 'invalid_target');
   const badPkce = await postForm(discovery.token_endpoint, { ...exchange, code_verifier: 'a'.repeat(43) });
   assert.equal((await badPkce.json()).error, 'invalid_grant');
+  const crossClientCode = await postForm(discovery.token_endpoint, {
+    ...exchange, client_id: otherClient.clientId, client_secret: otherClient.clientSecret, resource,
+  });
+  assert.equal((await crossClientCode.json()).error, 'invalid_grant');
   const tokenResponse = await postForm(discovery.token_endpoint, exchange);
   assert.equal(tokenResponse.status, 200);
   const tokens = await tokenResponse.json();
@@ -164,7 +207,7 @@ test('ChatGPT OAuth and Desktop Commander Streamable HTTP', { timeout: 60_000 },
   });
   assert.equal(invalidOrigin.status, 403);
   const refresh = await postForm(discovery.token_endpoint, {
-    grant_type: 'refresh_token', refresh_token: tokens.refresh_token, resource,
+    grant_type: 'refresh_token', refresh_token: tokens.refresh_token, ...resourceParameter,
   }, { Authorization: `Basic ${Buffer.from(`${clientId}:${clientSecret}`).toString('base64')}` });
   assert.equal(refresh.status, 200);
   const refreshed = await refresh.json();
@@ -172,8 +215,24 @@ test('ChatGPT OAuth and Desktop Commander Streamable HTTP', { timeout: 60_000 },
   t.diagnostic('OAuth login, exact callback, issuer and state, S256 exchange, replay rejection, and token refresh verified');
 
   let streamed = false;
+  let accessToken = refreshed.access_token;
+  if (existingCredentials) {
+    // Exercise the previous gateway's signed refresh-token format using its original signing key.
+    const payload = Buffer.from(JSON.stringify({
+      type: 'refresh', issuer: base, resource, client: clientId, scope: 'desktop-commander',
+      expires: Math.floor(Date.now() / 1000) + 300, id: randomBytes(32).toString('base64url'),
+    })).toString('base64url');
+    const signature = createHmac('sha256', Buffer.from(existingCredentials.signingKey, 'base64url'))
+      .update(payload).digest('base64url');
+    const priorGrant = await postForm(discovery.token_endpoint, {
+      client_id: clientId, client_secret: clientSecret, grant_type: 'refresh_token', refresh_token: `${payload}.${signature}`,
+    });
+    assert.equal(priorGrant.status, 200);
+    accessToken = (await priorGrant.json()).access_token;
+    t.diagnostic('Existing ChatGPT credentials were preserved and a pre-upgrade refresh token was accepted');
+  }
   const transport = new StreamableHTTPClientTransport(new URL(resource), {
-    requestInit: { headers: { Authorization: `Bearer ${refreshed.access_token}` } },
+    requestInit: { headers: { Authorization: `Bearer ${accessToken}` } },
     fetch: async (url, options) => {
       const response = await fetchMcp(url, options);
       if (options?.method === 'POST' && response.headers.get('content-type')?.startsWith('text/event-stream')) streamed = true;
@@ -209,7 +268,11 @@ test('ChatGPT OAuth and Desktop Commander Streamable HTTP', { timeout: 60_000 },
   const sessionId = transport.sessionId;
   await transport.terminateSession();
   const ended = await fetchMcp(resource, {
-    headers: { Authorization: `Bearer ${refreshed.access_token}`, 'Mcp-Session-Id': sessionId, Accept: 'text/event-stream' },
+    headers: { Authorization: `Bearer ${accessToken}`, 'Mcp-Session-Id': sessionId, Accept: 'text/event-stream' },
   });
   assert.equal(ended.status, 404);
-});
+}
+
+for (const [provider, name] of [['chatgpt', 'ChatGPT'], ['gemini', 'Gemini']]) {
+  test(`${name} OAuth and Desktop Commander Streamable HTTP`, { timeout: 60_000 }, t => checkConnection(t, provider));
+}

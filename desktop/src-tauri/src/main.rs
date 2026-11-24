@@ -25,6 +25,7 @@ use tauri_plugin_clipboard_manager::ClipboardExt;
 const TAILSCALE_DOWNLOAD: &str = "https://tailscale.com/download";
 const TAILSCALE_FUNNEL: &str = "https://tailscale.com/docs/features/tailscale-funnel#enable-funnel";
 const CHATGPT_PLUGINS: &str = "https://chatgpt.com/plugins";
+const GEMINI: &str = "https://gemini.google.com/";
 const MAX_ACTIVITY: usize = 300;
 
 #[derive(Clone, Copy, Default, PartialEq, Serialize)]
@@ -46,6 +47,7 @@ struct Snapshot {
     can_hide: bool,
     url: Option<String>,
     client_id: Option<String>,
+    gemini_client_id: Option<String>,
     setup_url: Option<String>,
     message: Option<String>,
     settings: Settings,
@@ -56,6 +58,7 @@ struct Snapshot {
 struct Gateway {
     snapshot: Snapshot,
     credentials_path: Option<PathBuf>,
+    gemini_credentials_path: Option<PathBuf>,
     child_input: Option<ChildStdin>,
     quitting: bool,
     activity: VecDeque<Activity>,
@@ -83,6 +86,8 @@ enum GatewayEvent {
         url: String,
         credentials_path: PathBuf,
         client_id: String,
+        gemini_credentials_path: PathBuf,
+        gemini_client_id: String,
     },
     Ready,
     Enable {
@@ -227,10 +232,14 @@ fn worker(app: &AppHandle, tailscale: PathBuf, settings: Settings) -> Result<(),
                     url,
                     credentials_path,
                     client_id,
+                    gemini_credentials_path,
+                    gemini_client_id,
                 } => {
                     state.snapshot.url = Some(url);
                     state.snapshot.client_id = Some(client_id);
+                    state.snapshot.gemini_client_id = Some(gemini_client_id);
                     state.credentials_path = Some(credentials_path);
+                    state.gemini_credentials_path = Some(gemini_credentials_path);
                 }
                 GatewayEvent::Ready => {
                     state.snapshot.phase = Phase::Running;
@@ -311,7 +320,9 @@ fn start_gateway(app: AppHandle, managed: State<'_, GatewayState>) -> Result<(),
     state.snapshot.setup_url = None;
     state.snapshot.url = None;
     state.snapshot.client_id = None;
+    state.snapshot.gemini_client_id = None;
     state.credentials_path = None;
+    state.gemini_credentials_path = None;
     let settings = state.snapshot.settings.clone();
     record(
         &app,
@@ -417,6 +428,7 @@ fn copy_value(app: AppHandle, managed: State<'_, GatewayState>, field: &str) -> 
     let value = match field {
         "url" => state.snapshot.url.clone(),
         "clientId" => state.snapshot.client_id.clone(),
+        "geminiClientId" => state.snapshot.gemini_client_id.clone(),
         "activity" => Some(
             state
                 .activity
@@ -442,15 +454,18 @@ fn copy_value(app: AppHandle, managed: State<'_, GatewayState>, field: &str) -> 
         "operator" if cfg!(target_os = "linux") => {
             Some("sudo tailscale set --operator=\"$USER\"".into())
         }
-        "clientSecret" | "loginPassword" => {
-            let path = state
-                .credentials_path
-                .as_ref()
-                .ok_or("Start the connection first.")?;
+        "clientSecret" | "loginPassword" | "geminiClientSecret" | "geminiLoginPassword" => {
+            let path = if field.starts_with("gemini") {
+                &state.gemini_credentials_path
+            } else {
+                &state.credentials_path
+            }
+            .as_ref()
+            .ok_or("Start the connection first.")?;
             let content = fs::read(path).map_err(|_| "Could not read the local credentials.")?;
             let credentials: Credentials = serde_json::from_slice(&content)
                 .map_err(|_| "Could not read the local credentials.")?;
-            Some(if field == "clientSecret" {
+            Some(if matches!(field, "clientSecret" | "geminiClientSecret") {
                 credentials.client_secret
             } else {
                 credentials.login_password
@@ -469,6 +484,7 @@ fn open_link(managed: State<'_, GatewayState>, link: &str) -> Result<(), String>
         "tailscale" => TAILSCALE_DOWNLOAD,
         "funnel" => TAILSCALE_FUNNEL,
         "chatgpt" => CHATGPT_PLUGINS,
+        "gemini" => GEMINI,
         "enable" => state
             .snapshot
             .setup_url

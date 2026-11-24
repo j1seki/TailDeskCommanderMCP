@@ -10,8 +10,8 @@ import { native } from './native';
 import type { ActivityEntry, CopyField, Destination, GatewayState, Level, Phase, Settings } from './native';
 
 const navigation = [
-  { id: 'overview', name: 'Overview', icon: LayoutDashboard, description: 'Start, stop, and check your ChatGPT connection.' },
-  { id: 'setup', name: 'ChatGPT setup', icon: Cable, description: 'Connect ChatGPT to Desktop Commander in three steps.' },
+  { id: 'overview', name: 'Overview', icon: LayoutDashboard, description: 'Start, stop, and check your MCP connection.' },
+  { id: 'setup', name: 'Client setup', icon: Cable, description: 'Connect ChatGPT or Gemini to Desktop Commander.' },
   { id: 'activity', name: 'Activity', icon: Activity, description: 'Review connection, runtime, and Tailscale events.' },
   { id: 'settings', name: 'Settings', icon: Settings2, description: 'Manage connection preferences and window behavior.' },
 ] as const;
@@ -91,7 +91,7 @@ function Overview({ state, entries, actions }: { state: GatewayState, entries: A
         <Status phase={state.phase} />
       </div>
       <div className="connection-heading">
-        <div><h2 id="connection-title">MCP connection</h2><p>{running ? 'ChatGPT can reach this computer through Tailscale Funnel.' : 'Publish the local MCP server through Tailscale Funnel.'}</p></div>
+        <div><h2 id="connection-title">MCP connection</h2><p>{running ? 'ChatGPT and Gemini can reach this computer through Tailscale Funnel.' : 'Publish the local MCP server through Tailscale Funnel.'}</p></div>
         <button className={`button ${inProgress ? 'secondary' : 'primary'}`} disabled={pending || stopping} onClick={() => void toggle()}>
           {stopping ? <LoaderCircle className="spin" /> : inProgress ? <Square /> : <Play />}{!state.tailscaleInstalled && !inProgress ? 'Set up Tailscale' : buttonLabel}
         </button>
@@ -103,7 +103,7 @@ function Overview({ state, entries, actions }: { state: GatewayState, entries: A
     </section>
     <Notice state={state} actions={actions} />
     <div className="metrics">
-      <section className="panel metric"><div className="metric-icon"><ShieldCheck /></div><div><h2>Tailscale</h2><p>{state.tailscaleInstalled ? 'Installed on this computer' : 'Install Tailscale to get started'}</p></div><button className="icon-button" aria-label="Open ChatGPT setup" onClick={() => actions.go('setup')}><ChevronRight /></button></section>
+      <section className="panel metric"><div className="metric-icon"><ShieldCheck /></div><div><h2>Tailscale</h2><p>{state.tailscaleInstalled ? 'Installed on this computer' : 'Install Tailscale to get started'}</p></div><button className="icon-button" aria-label="Open client setup" onClick={() => actions.go('setup')}><ChevronRight /></button></section>
       <section className="panel metric"><div className="metric-icon"><Clock3 /></div><div><h2>Current session</h2><p>{state.startedAt ? `Started at ${clock.format(state.startedAt)}` : 'Connection inactive'}</p></div></section>
     </div>
     <section className="panel recent">
@@ -114,16 +114,23 @@ function Overview({ state, entries, actions }: { state: GatewayState, entries: A
 }
 
 function Setup({ state, actions }: { state: GatewayState, actions: Actions }) {
+  const [provider, setProvider] = useState<'chatgpt' | 'gemini'>('chatgpt');
+  const gemini = provider === 'gemini';
+  const name = gemini ? 'Gemini' : 'ChatGPT';
   const running = state.phase === 'running';
   const credentials: { field: CopyField, label: string, value: string }[] = [
     { field: 'url', label: 'Server URL', value: state.url ?? 'Available after startup' },
-    { field: 'clientId', label: 'OAuth client ID', value: state.clientId ?? 'Available after startup' },
-    { field: 'clientSecret', label: 'OAuth client secret', value: '••••••••••••' },
-    { field: 'loginPassword', label: 'Login password', value: '••••••••••••' },
+    { field: gemini ? 'geminiClientId' : 'clientId', label: 'OAuth client ID', value: (gemini ? state.geminiClientId : state.clientId) ?? 'Available after startup' },
+    { field: gemini ? 'geminiClientSecret' : 'clientSecret', label: 'OAuth client secret', value: '••••••••••••' },
+    { field: gemini ? 'geminiLoginPassword' : 'loginPassword', label: 'Login password', value: '••••••••••••' },
   ];
 
   return <div className="stack">
     <Notice state={state} actions={actions} />
+    <div className="client-choice" role="group" aria-label="Client to connect">
+      <button type="button" aria-pressed={!gemini} onClick={() => setProvider('chatgpt')}>ChatGPT</button>
+      <button type="button" aria-pressed={gemini} onClick={() => setProvider('gemini')}>Gemini</button>
+    </div>
     <div className="setup-grid">
       <div className="stack">
         <section className="panel step"><span className="step-index">1</span><div>
@@ -134,15 +141,18 @@ function Setup({ state, actions }: { state: GatewayState, actions: Actions }) {
           </div>
         </div></section>
         <section className="panel step"><span className="step-index">2</span><div>
-          <h2>Add the server in ChatGPT</h2><p>Open <strong>Plugins → Add custom MCP server</strong>. Paste the server URL, choose <strong>OAuth</strong>, and enter the client ID and secret.</p>
-          <button className="text-button" onClick={() => actions.open('chatgpt')}>Open ChatGPT <ArrowUpRight /></button>
+          <h2>Add the server in {name}</h2>
+          {gemini
+            ? <p>Open <strong>Settings → Connected Apps → Custom apps</strong>. Enter the server URL, then use <strong>Advanced features → Show more</strong> to enter the client ID and secret.</p>
+            : <p>Open <strong>Plugins → Add custom MCP server</strong>. Paste the server URL, choose <strong>OAuth</strong>, and enter the client ID and secret.</p>}
+          <button className="text-button" onClick={() => actions.open(provider)}>Open {name} <ArrowUpRight /></button>
         </div></section>
         <section className="panel step"><span className="step-index">3</span><div>
           <h2>Authorize the connection</h2><p>When Desktop Commander opens in your browser, paste the login password and select <strong>Authorize</strong>.</p>
         </div></section>
       </div>
       <section className="panel credentials">
-        <div className="panel-heading"><div className="icon-heading"><div className="metric-icon"><KeyRound /></div><div><h2>Connection values</h2><p>Copy into the matching ChatGPT fields.</p></div></div></div>
+        <div className="panel-heading"><div className="icon-heading"><div className="metric-icon"><KeyRound /></div><div><h2>Connection values</h2><p>Copy into the matching {name} fields.</p></div></div></div>
         {credentials.map(({ field, label, value }) => <div className="credential" key={field}>
           <div><span className="field-label">{label}</span><code>{running ? value : 'Available after startup'}</code></div>
           <CopyButton field={field} label={label} copy={actions.copy} disabled={!running} />

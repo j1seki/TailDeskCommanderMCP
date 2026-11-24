@@ -86,6 +86,9 @@ code { display: block; font: .72rem/1.4 var(--mono); color: #dbece7; overflow-wr
 .panel-heading { padding: 15px 16px; }
 .panel-heading > svg { color: #93aaa8; }
 .icon-heading { display: flex; align-items: center; gap: 9px; }
+.client-choice { display: inline-flex; justify-self: start; gap: 4px; padding: 4px; border: 1px solid var(--line); border-radius: 9px; background: var(--panel); }
+.client-choice button { min-width: 86px; padding: 7px 11px; border: 1px solid transparent; border-radius: 6px; background: transparent; color: var(--muted); font-size: .8rem; font-weight: 630; }
+.client-choice button[aria-pressed=true] { border-color: #38574f; background: #213d35; color: var(--green); }
 .notice { display: flex; gap: 10px; padding: 12px 14px; background: #2b241b; border: 1px solid #56432c; border-radius: 9px; color: #f5cc8d; }
 .notice svg { margin-top: 1px; }
 .notice strong { font-size: .82rem; }
