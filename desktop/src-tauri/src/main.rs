@@ -310,7 +310,7 @@ fn worker(app: &AppHandle, tunnel: PathBuf, settings: Settings) -> Result<(), St
                         &mut state,
                         "info",
                         "Tunnel",
-                        "The public HTTPS route is active.",
+                        "The public tunnel is running.",
                     );
                 }
                 GatewayEvent::Enable { setup_url } => {

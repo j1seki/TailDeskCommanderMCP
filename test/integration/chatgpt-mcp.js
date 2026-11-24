@@ -319,3 +319,35 @@ for (const [provider, name] of [['chatgpt', 'ChatGPT'], ['gemini', 'Gemini']]) {
       { timeout: 60_000 }, t => checkConnection(t, provider, jsonResponses));
   }
 }
+
+test('A registered Quick Tunnel remains open while HTTPS is being checked',
+  { skip: windows || Boolean(externalUrl), timeout: 15_000 }, async t => {
+    const dir = await mkdtemp(join(tmpdir(), 'taildesk-quick-start-'));
+    const connector = join(dir, 'cloudflared');
+    const hostname = `taildesk-test-${randomBytes(8).toString('hex')}.trycloudflare.com`;
+    await writeFile(connector, `#!/bin/sh\nprintf '%s\\n' 'https://${hostname}' 'Registered tunnel connection'\nexec sleep 60\n`,
+      { mode: 0o700 });
+    const entry = fileURLToPath(new URL('../../scripts/chatgpt-mcp.mjs', import.meta.url));
+    const gateway = spawn(process.execPath, [entry, '--desktop'], {
+      env: { ...process.env, DC_MCP_TUNNEL: 'cloudflare', DC_MCP_CLOUDFLARED: connector,
+        DC_CHATGPT_STATE_DIR: join(dir, 'oauth'), DC_CHATGPT_LOCAL_PORT: '0' },
+      stdio: ['pipe', 'pipe', 'inherit'],
+    });
+    const closed = once(gateway, 'close');
+    t.after(async () => {
+      gateway.stdin.end();
+      await closed;
+      await rm(dir, { force: true, recursive: true });
+    });
+    let ready = false;
+    for await (const line of createInterface({ input: gateway.stdout })) {
+      const event = JSON.parse(line);
+      if (event.type === 'error') throw new Error(event.message);
+      if (event.type === 'gateway') assert.equal(event.url, `https://${hostname}/mcp`);
+      if (event.type === 'ready') {
+        ready = true;
+        break;
+      }
+    }
+    assert.ok(ready, 'Gateway did not wait for public DNS before emitting Ready');
+  });

@@ -235,13 +235,15 @@ function startQuickTunnel(localPort, config) {
   ], { stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true });
   const closed = new Promise(resolve => child.once('close', resolve));
   const address = new Promise((resolve, reject) => {
-    let lastError;
-    const timeout = setTimeout(() => reject(new Error('Cloudflare did not assign a Quick Tunnel URL in time.')), 35_000);
+    let lastError, url;
+    let registered = false;
+    const timeout = setTimeout(() => reject(new Error('Cloudflare did not register the Quick Tunnel in time.')), 35_000);
     for (const stream of [child.stdout, child.stderr]) {
       createInterface({ input: stream }).on('line', line => {
         if (/\bERR\b|\bfailed\b/i.test(line)) lastError = line.slice(0, 500);
-        const url = line.match(/https:\/\/[a-z0-9-]+\.trycloudflare\.com\b/i)?.[0];
-        if (url) {
+        url ??= line.match(/https:\/\/[a-z0-9-]+\.trycloudflare\.com\b/i)?.[0];
+        registered ||= line.includes('Registered tunnel connection');
+        if (url && registered) {
           clearTimeout(timeout);
           resolve(new URL(url).origin);
         }
@@ -253,15 +255,15 @@ function startQuickTunnel(localPort, config) {
     });
     void closed.then(() => {
       clearTimeout(timeout);
-      reject(new Error(lastError || 'cloudflared exited before providing a Quick Tunnel URL.'));
+      reject(new Error(lastError || 'cloudflared exited before registering the Quick Tunnel.'));
     });
   });
   return { child, closed, address };
 }
 
-async function probeQuickTunnel(endpoint, signal) {
+async function probeQuickTunnel(endpoint, resolver, signal) {
   const url = new URL(endpoint);
-  const dns = new URL('https://cloudflare-dns.com/dns-query');
+  const dns = new URL(resolver);
   dns.search = new URLSearchParams({ name: url.hostname, type: 'A' });
   const answer = await fetch(dns, { signal, headers: { Accept: 'application/dns-json' } });
   const { Answer = [] } = await answer.json();
@@ -291,21 +293,23 @@ async function probeQuickTunnel(endpoint, signal) {
   });
 }
 
-async function checkHttps(issuer, signal, quick = false) {
+async function checkHttps(issuer, shutdownSignal, quick = false) {
   const endpoint = `${issuer}/.well-known/oauth-protected-resource/mcp`;
-  for (let attempt = 0; attempt < 8 && !signal.aborted; attempt++) {
+  const signal = AbortSignal.any([shutdownSignal, AbortSignal.timeout(quick ? 60_000 : 20_000)]);
+  const resolvers = ['https://cloudflare-dns.com/dns-query', 'https://dns.google/resolve'];
+  for (let attempt = 0; !signal.aborted; attempt++) {
     try {
       const response = await fetch(endpoint, {
         redirect: 'error', signal: AbortSignal.any([signal, AbortSignal.timeout(3_000)]),
       });
       if (response.ok && (await response.json()).resource === `${issuer}/mcp`) return true;
     } catch {
-      // Some local resolvers cache negative answers for newly issued Quick Tunnel hostnames.
-      if (quick && !signal.aborted) {
-        const reachable = await probeQuickTunnel(endpoint, AbortSignal.any([signal, AbortSignal.timeout(3_000)]))
-          .catch(() => false);
-        if (reachable) return true;
-      }
+      // DNS and routing may still be propagating.
+    }
+    if (quick && !signal.aborted) {
+      const reachable = await probeQuickTunnel(endpoint, resolvers[attempt % resolvers.length],
+        AbortSignal.any([signal, AbortSignal.timeout(3_000)])).catch(() => false);
+      if (reachable) return true;
     }
     await delay(1_000, undefined, { signal }).catch(() => {});
   }
@@ -436,11 +440,9 @@ async function main() {
         : 'Could not verify the HTTPS endpoint. Check the tunnel connection.');
     }
     if (quick) {
-      const passed = await checkHttps(issuer, shutdownSignal.signal, true);
-      reportHttps(passed);
-      if (stopping) return;
-      if (!passed) throw new Error('The Cloudflare Quick Tunnel did not reach this MCP server.');
       emit('ready');
+      // A slow resolver should not terminate a registered tunnel or discard its hostname.
+      void checkHttps(issuer, shutdownSignal.signal, true).then(reportHttps);
       await tunnel.closed;
       if (!stopping) throw new Error('The Cloudflare Quick Tunnel closed. Start a new connection to get a new URL.');
     } else if (funnel) {
