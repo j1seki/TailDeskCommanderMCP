@@ -65,29 +65,32 @@ async function copyNode() {
 }
 
 async function copyRipgrep() {
-  const packageDir = join(staging, 'node_modules', '@vscode', 'ripgrep');
-  if (native) {
-    run(process.execPath, ['lib/postinstall.js'], packageDir);
-  } else {
-    const rgVersion = '15.1.0';
-    const triple = `${arch === 'x64' ? 'x86_64' : 'aarch64'}-${windows ? 'pc-windows-msvc' : 'apple-darwin'}`;
-    const directory = `ripgrep-${rgVersion}-${triple}`;
-    const filename = `${directory}.${windows ? 'zip' : 'tar.gz'}`;
-    const archive = join(staging, filename);
-    const url = `https://github.com/BurntSushi/ripgrep/releases/download/${rgVersion}/${filename}`;
-    const [binary, sha] = await Promise.all([fetchFile(url), fetchFile(`${url}.sha256`)]);
-    const expected = sha.toString().match(/\b[a-f0-9]{64}\b/i)?.[0].toLowerCase();
-    if (createHash('sha256').update(binary).digest('hex') !== expected) {
-      throw new Error('ripgrep archive checksum mismatch');
-    }
-    await writeFile(archive, binary);
-    const bin = join(packageDir, 'bin');
-    await mkdir(bin);
-    if (windows) run('unzip', ['-j', archive, '*/rg.exe', '-d', bin], staging);
-    else run('tar', ['-xzf', archive, '--strip-components=1', `${directory}/rg`], bin);
-    await rm(archive);
+  const version = '15.1.0';
+  const targets = { darwin: 'apple-darwin', win32: 'pc-windows-msvc', linux: arch === 'arm64' ? 'unknown-linux-gnu' : 'unknown-linux-musl' };
+  if (!targets[platform] || !['arm64', 'x64'].includes(arch)) {
+    throw new Error(`No bundled ripgrep release for ${platform}-${arch}`);
   }
-  await readFile(join(packageDir, 'bin', windows ? 'rg.exe' : 'rg'));
+  const target = `${arch === 'x64' ? 'x86_64' : 'aarch64'}-${targets[platform]}`;
+  const directory = `ripgrep-${version}-${target}`;
+  const filename = `${directory}.${windows ? 'zip' : 'tar.gz'}`;
+  const url = `https://github.com/BurntSushi/ripgrep/releases/download/${version}/${filename}`;
+  const [binary, sha] = await Promise.all([fetchFile(url), fetchFile(`${url}.sha256`)]);
+  const expected = sha.toString().match(/\b[a-f0-9]{64}\b/i)?.[0].toLowerCase();
+  if (createHash('sha256').update(binary).digest('hex') !== expected) {
+    throw new Error('ripgrep archive checksum mismatch');
+  }
+
+  const archive = join(staging, filename);
+  const bin = join(staging, 'node_modules', '@vscode', 'ripgrep', 'bin');
+  const files = [windows ? 'rg.exe' : 'rg', 'LICENSE-MIT', 'UNLICENSE'].map(name => `${directory}/${name}`);
+  await writeFile(archive, binary);
+  await mkdir(bin);
+  if (windows && !native) {
+    run('unzip', ['-j', archive, ...files, '-d', bin], staging);
+  } else {
+    run(windows ? 'tar.exe' : 'tar', ['-xf', archive, '--strip-components=1', ...files], bin);
+  }
+  await rm(archive);
 }
 
 try {

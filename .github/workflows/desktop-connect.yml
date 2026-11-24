@@ -49,7 +49,8 @@ jobs:
           sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev patchelf
       - name: Build and stage Desktop Commander
         run: |
-          npm ci --include=dev --no-audit
+          npm ci --include=dev --ignore-scripts --no-audit
+          npm run build
           npm --prefix desktop ci --no-audit
           npm --prefix desktop run prepare-runtime
       - name: Test OAuth and MCP

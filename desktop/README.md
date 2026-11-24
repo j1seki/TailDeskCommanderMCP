@@ -22,7 +22,8 @@ The **TailDeskCommanderMCP packages** GitHub Actions workflow builds Windows x64
 On a development machine, install Node 22.12 or later, Rust, and the Tauri build prerequisites for that OS. [Tauri prerequisites](https://v2.tauri.app/start/prerequisites/)
 
 ```bash
-npm ci --include=dev
+npm ci --include=dev --ignore-scripts
+npm run build
 npm --prefix desktop ci
 npm --prefix desktop run prepare-runtime
 ```
